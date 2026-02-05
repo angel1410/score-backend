@@ -21,4 +21,5 @@ Cargo.lock
 #.idea/
 
 .env
+check-env.sh
 # *.log
