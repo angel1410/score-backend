@@ -19,11 +19,13 @@ mod structs {
 mod modules {
     pub mod login;
     pub mod re;
+    pub mod ac;
     pub mod users;
 
     pub use login::get_login;
     pub use re::{get_movimientos_re, get_elector}; // ✅ agregado get_elector
     pub use users::{get_usuarios, crear_usuario, actualizar_usuario, bloquear_usuario, carga_masiva};
+    pub use ac::{get_usuario_by_ac}; // ✅ agregado get_usuario_by_ac
 }
 
 #[actix_web::main]
@@ -73,7 +75,8 @@ async fn main() -> std::io::Result<()> {
                     .route("/usuarios", web::post().to(modules::crear_usuario))
                     .route("/usuarios/{id}", web::put().to(modules::actualizar_usuario))
                     .route("/usuarios/{id}/bloquear", web::put().to(modules::bloquear_usuario))
-                    .route("/usuarios/carga-masiva", web::post().to(modules::carga_masiva)),
+                    .route("/usuarios/carga-masiva", web::post().to(modules::carga_masiva))
+                    .route("/get_usuario_by_ac/{nacionalidad}/{cedula}", web::get().to(modules::get_usuario_by_ac)),
             )
     })
     .bind(("127.0.0.1", 9000))?
