@@ -68,7 +68,7 @@ async fn main() -> std::io::Result<()> {
                     .route(
                         "/get-movimientos-re/{nacionalidad}/{cedula}",
                         web::get().to(modules::get_movimientos_re),)
-                    .route("/re/elector", web::get().to(modules::get_elector))
+                    .route("/get_elector", web::get().to(modules::get_elector))
                     .route("/usuarios", web::get().to(modules::get_usuarios))
                     .route("/usuarios", web::post().to(modules::crear_usuario))
                     .route("/usuarios/{id}", web::put().to(modules::actualizar_usuario))

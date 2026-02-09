@@ -81,7 +81,7 @@ pub async fn get_movimientos_re(
 
 #[derive(Deserialize)]
 pub struct ElectorQuery {
-    pub nac: String,     // V / E
+    pub nacionalidad: String,     // V / E
     pub cedula: i64,     // 28524669
 }
 
@@ -122,11 +122,11 @@ fn yyyymmdd_to_iso(s: &str) -> Option<String> {
 pub async fn get_elector(
     query: web::Query<ElectorQuery>,
 ) -> Result<HttpResponse, Error> {
-    let nac = query.nac.trim().to_uppercase();
-    let nac_char = nac.chars().next().unwrap_or('V').to_string();
+    let nac = query.nacionalidad.trim().to_uppercase();
+    let nacionalidad = nac.chars().next().unwrap_or('V').to_string();
     let cedula = query.cedula;
 
-    if !(nac_char == "V" || nac_char == "E") {
+    if !(nacionalidad == "V" || nacionalidad == "E") {
         return Err(actix_web::error::ErrorBadRequest("nac debe ser V o E"));
     }
     if cedula <= 0 || cedula > 99_999_999 {
@@ -137,7 +137,7 @@ pub async fn get_elector(
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e)))?;
 
     let mut resp = ElectorResponse {
-        nacionalidad: nac_char.clone(),
+        nacionalidad: nacionalidad.clone(),
         cedula,
         ..Default::default()
     };
@@ -154,11 +154,11 @@ pub async fn get_elector(
           OBJ.DESCRIPCION
         FROM AC AC
         JOIN OBJECION OBJ ON AC.STATUS_OBJECION = OBJ.STATUS
-        WHERE AC.NACIONALIDAD = :nac
-          AND AC.CEDULA = :ced
+        WHERE AC.NACIONALIDAD = :nacionalidad
+          AND AC.CEDULA = :cedula
     "#;
 
-    let mut rows = conn.query(sql_persona, &[&nac_char, &cedula])
+    let mut rows = conn.query(sql_persona, &[&nacionalidad, &cedula])
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error query persona: {}", e)))?;
 
     let row_opt = rows.next().transpose()
@@ -194,11 +194,11 @@ pub async fn get_elector(
           cod_parroquia,
           nu_centro
         FROM instrumentos.cuaderno_actual2
-        WHERE co_nacionalidad = :nac
-          AND nu_cedula = :ced
+        WHERE co_nacionalidad = :nacionalidad
+          AND nu_cedula = :cedula
     "#;
 
-    let mut rows2 = conn.query(sql_cuaderno, &[&nac_char, &cedula])
+    let mut rows2 = conn.query(sql_cuaderno, &[&nacionalidad, &cedula])
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error query cuaderno: {}", e)))?;
 
     let row2_opt = rows2.next().transpose()
