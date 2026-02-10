@@ -45,9 +45,16 @@ pub struct UsuarioConPassword {
 }
 
 fn generar_login(nombre: &str, apellido: &str, cedula: i32) -> String {
-    let inicial_nombre = nombre.chars().next().map(|c| c.to_lowercase().to_string()).unwrap_or_default();
-    let inicial_apellido = apellido.chars().next().map(|c| c.to_lowercase().to_string()).unwrap_or_default();
-    format!("{}{}{}", inicial_nombre, inicial_apellido, cedula)
+    // ✅ CORREGIDO: inicial nombre + apellido COMPLETO + cedula
+    let inicial_nombre = nombre
+        .chars()
+        .next()
+        .map(|c| c.to_lowercase().to_string())
+        .unwrap_or_default();
+    
+    let apellido_limpio = apellido.trim().to_lowercase();
+    
+    format!("{}{}{}", inicial_nombre, apellido_limpio, cedula)
 }
 
 fn generar_password() -> String {
