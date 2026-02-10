@@ -2,6 +2,7 @@ use actix_web::{web, HttpResponse, Error};
 use oracle::{Connection, Row, RowValue};
 use serde::Deserialize;
 use std::env;
+use std::time::Instant;
 
 // =====================
 // Movimiento RE (tu código)
@@ -411,4 +412,248 @@ pub async fn get_elector(
     }
 
     Ok(HttpResponse::Ok().json(resp))
+}
+
+
+// =====================
+// NUEVO: Lista de electores (para DataTable)
+// GET /get_electores?primer_nombre=...&fecha_nacimiento=YYYY-MM-DD...
+// =====================
+
+#[derive(Deserialize)]
+pub struct ElectoresQuery {
+    pub nacionalidad: Option<String>,     // V / E (opcional)
+    pub cedula: Option<i64>,              // opcional
+    pub fecha_nacimiento: Option<String>, // YYYY-MM-DD (opcional)
+
+    pub primer_nombre: Option<String>,
+    pub segundo_nombre: Option<String>,
+    pub primer_apellido: Option<String>,
+    pub segundo_apellido: Option<String>,
+
+    pub codigo_centro: Option<String>,    // opcional
+
+    pub first: Option<u32>, // offset
+    pub rows: Option<u32>,  // limit
+}
+
+#[derive(serde::Serialize, Default)]
+pub struct ElectorListaItem {
+    pub nacionalidad: String,
+    pub cedula: i64,
+    pub fecha_nacimiento: Option<String>, // YYYY-MM-DD
+    pub primer_nombre: Option<String>,
+    pub segundo_nombre: Option<String>,
+    pub primer_apellido: Option<String>,
+    pub segundo_apellido: Option<String>,
+    pub codigo_centro: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct PagedResponse<T> {
+    pub items: Vec<T>,
+    pub total: i64,
+}
+
+
+// "2026-02-09" -> "20260209"
+fn iso_to_yyyymmdd(s: &str) -> Option<String> {
+    if s.len() != 10 { return None; }
+    let y = &s[0..4];
+    let m = &s[5..7];
+    let d = &s[8..10];
+    Some(format!("{y}{m}{d}"))
+}
+
+pub async fn get_electores(
+    query: web::Query<ElectoresQuery>,
+) -> Result<HttpResponse, Error> {
+    let q = query.into_inner();
+
+    let t_all = Instant::now();
+
+    let first = q.first.unwrap_or(0) as i64; // offset
+    let rows  = q.rows.unwrap_or(10) as i64; // page size
+
+    // 1) Validar: al menos 1 dato
+    let hay_dato =
+        q.cedula.is_some()
+        || q.fecha_nacimiento.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.primer_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.segundo_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.primer_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.segundo_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.codigo_centro.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.nacionalidad.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+
+    if !hay_dato {
+        return Err(actix_web::error::ErrorBadRequest("Ingrese al menos un dato"));
+    }
+
+    // 2) Conexión Oracle
+    let conn = oracle_conn()
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e)))?;
+
+    // 3) FROM + WHERE reutilizable
+    let mut from_where = String::from(r#"
+        FROM AC AC
+        LEFT JOIN instrumentos.cuaderno_actual2 CA
+          ON CA.CO_NACIONALIDAD = AC.NACIONALIDAD
+         AND CA.NU_CEDULA = AC.CEDULA
+        WHERE 1=1
+    "#);
+
+    // 4) binds
+    let mut binds_str: Vec<(String, String)> = vec![];
+    let mut binds_i64: Vec<(String, i64)> = vec![];
+
+    fn eq_param(s: &str) -> String {
+        s.trim().to_uppercase()
+    }
+
+    // 5) filtros
+    if let Some(nac) = q.nacionalidad.as_ref().map(|x| x.trim().to_uppercase()) {
+        if nac == "V" || nac == "E" {
+            from_where.push_str(" AND AC.NACIONALIDAD = :nacionalidad ");
+            binds_str.push(("nacionalidad".into(), nac));
+        }
+    }
+
+    if let Some(ced) = q.cedula {
+        if ced <= 0 || ced > 99_999_999 {
+            return Err(actix_web::error::ErrorBadRequest("cedula inválida"));
+        }
+        from_where.push_str(" AND AC.CEDULA = :cedula ");
+        binds_i64.push(("cedula".into(), ced));
+    }
+
+    if let Some(fnac_iso) = q.fecha_nacimiento.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        let yyyymmdd = iso_to_yyyymmdd(fnac_iso)
+            .ok_or_else(|| actix_web::error::ErrorBadRequest("fecha_nacimiento inválida (YYYY-MM-DD)"))?;
+        from_where.push_str(" AND AC.FECHA_NACIMIENTO_4 = :fecha_nacimiento ");
+        binds_str.push(("fecha_nacimiento".into(), yyyymmdd));
+    }
+
+    if let Some(s) = q.primer_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        from_where.push_str(" AND UPPER(AC.PRIMER_NOMBRE) = :primer_nombre ");
+        binds_str.push(("primer_nombre".into(), eq_param(s)));
+    }
+
+    if let Some(s) = q.segundo_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        from_where.push_str(" AND UPPER(AC.SEGUNDO_NOMBRE) = :segundo_nombre ");
+        binds_str.push(("segundo_nombre".into(), eq_param(s)));
+    }
+
+    if let Some(s) = q.primer_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        from_where.push_str(" AND UPPER(AC.PRIMER_APELLIDO) = :primer_apellido ");
+        binds_str.push(("primer_apellido".into(), eq_param(s)));
+    }
+
+    if let Some(s) = q.segundo_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        from_where.push_str(" AND UPPER(AC.SEGUNDO_APELLIDO) = :segundo_apellido ");
+        binds_str.push(("segundo_apellido".into(), eq_param(s)));
+    }
+
+    if let Some(s) = q.codigo_centro.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        from_where.push_str(" AND TO_CHAR(CA.NU_CENTRO) = :codigo_centro ");
+        binds_str.push(("codigo_centro".into(), s.to_string()));
+    }
+
+    // 6) params
+    let mut params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
+    for (k, v) in &binds_str {
+        params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
+    }
+    for (k, v) in &binds_i64 {
+        params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
+    }
+
+    // 7) COUNT (mídelo)
+    let sql_count = format!("SELECT COUNT(*) {}", from_where);
+
+    let t0 = Instant::now();
+    let mut rows_count = conn
+        .query_named(&sql_count, &params)
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error COUNT: {}", e)))?;
+
+    let total: i64 = if let Some(r) = rows_count.next().transpose()
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error leyendo COUNT: {}", e)))?
+    {
+        r.get(0).unwrap_or(0)
+    } else {
+        0
+    };
+    println!("get_electores COUNT ms = {}", t0.elapsed().as_millis());
+
+    // 8) SELECT paginado usando ROW_NUMBER
+    let start_rn = first + 1;
+    let end_rn = first + rows;
+
+    let sql_select = format!(r#"
+        SELECT
+          NACIONALIDAD,
+          CEDULA,
+          FECHA_NACIMIENTO_4,
+          PRIMER_NOMBRE,
+          SEGUNDO_NOMBRE,
+          PRIMER_APELLIDO,
+          SEGUNDO_APELLIDO,
+          NU_CENTRO
+        FROM (
+          SELECT
+            AC.NACIONALIDAD AS NACIONALIDAD,
+            AC.CEDULA AS CEDULA,
+            AC.FECHA_NACIMIENTO_4 AS FECHA_NACIMIENTO_4,
+            AC.PRIMER_NOMBRE AS PRIMER_NOMBRE,
+            AC.SEGUNDO_NOMBRE AS SEGUNDO_NOMBRE,
+            AC.PRIMER_APELLIDO AS PRIMER_APELLIDO,
+            AC.SEGUNDO_APELLIDO AS SEGUNDO_APELLIDO,
+            CA.NU_CENTRO AS NU_CENTRO,
+            ROW_NUMBER() OVER (ORDER BY AC.CEDULA) AS RN
+          {}
+        )
+        WHERE RN BETWEEN :rn_start AND :rn_end
+        ORDER BY RN
+    "#, from_where);
+
+    let mut params_paged: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
+    params_paged.extend_from_slice(&params);
+    params_paged.push(("rn_start", &start_rn));
+    params_paged.push(("rn_end", &end_rn));
+
+    let t1 = Instant::now();
+    let mut rows_data = conn
+        .query_named(&sql_select, &params_paged)
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error SELECT: {}", e)))?;
+    println!("get_electores SELECT ms = {}", t1.elapsed().as_millis());
+
+    let mut items: Vec<ElectorListaItem> = Vec::new();
+
+    while let Some(row) = rows_data.next().transpose()
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error leyendo filas: {}", e)))?
+    {
+        let nac: String = row.get(0).unwrap_or_else(|_| "V".to_string());
+        let ced: i64 = row.get(1).unwrap_or(0);
+
+        let fecha_raw: Option<String> = row.get(2).ok();
+        let fecha_iso = fecha_raw.as_deref().and_then(yyyymmdd_to_iso);
+
+        let centro_num: Option<i64> = row.get(7).ok();
+        let codigo_centro = centro_num.map(|x| format!("{:0>9}", x));
+
+        items.push(ElectorListaItem {
+            nacionalidad: nac,
+            cedula: ced,
+            fecha_nacimiento: fecha_iso,
+            primer_nombre: row.get(3).ok(),
+            segundo_nombre: row.get(4).ok(),
+            primer_apellido: row.get(5).ok(),
+            segundo_apellido: row.get(6).ok(),
+            codigo_centro,
+        });
+    }
+
+    println!("get_electores TOTAL ms = {}", t_all.elapsed().as_millis());
+
+    Ok(HttpResponse::Ok().json(PagedResponse { items, total }))
 }

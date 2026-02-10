@@ -23,7 +23,7 @@ mod modules {
     pub mod users;
 
     pub use login::get_login;
-    pub use re::{get_movimientos_re, get_elector}; // ✅ agregado get_elector
+    pub use re::{get_movimientos_re, get_elector, get_electores}; // ✅ agregado get_elector
     pub use users::{get_usuarios, crear_usuario, actualizar_usuario, bloquear_usuario, carga_masiva};
     pub use ac::{get_usuario_by_ac}; // ✅ agregado get_usuario_by_ac
 }
@@ -71,6 +71,7 @@ async fn main() -> std::io::Result<()> {
                         "/get-movimientos-re/{nacionalidad}/{cedula}",
                         web::get().to(modules::get_movimientos_re),)
                     .route("/get_elector", web::get().to(modules::get_elector))
+                    .route("/get_electores", web::get().to(modules::get_electores))
                     .route("/usuarios", web::get().to(modules::get_usuarios))
                     .route("/usuarios", web::post().to(modules::crear_usuario))
                     .route("/usuarios/{id}", web::put().to(modules::actualizar_usuario))
