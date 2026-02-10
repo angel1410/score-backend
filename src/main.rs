@@ -24,7 +24,7 @@ mod modules {
 
     pub use login::get_login;
     pub use re::{get_movimientos_re, get_elector, get_electores}; // ✅ agregado get_elector
-    pub use users::{get_usuarios, crear_usuario, actualizar_usuario, bloquear_usuario, carga_masiva};
+    pub use users::{get_usuarios, crear_usuario, actualizar_usuario, bloquear_usuario, carga_masiva, get_roles};
     pub use ac::{get_usuario_by_ac}; // ✅ agregado get_usuario_by_ac
 }
 
@@ -77,7 +77,8 @@ async fn main() -> std::io::Result<()> {
                     .route("/usuarios/{id}", web::put().to(modules::actualizar_usuario))
                     .route("/usuarios/{id}/bloquear", web::put().to(modules::bloquear_usuario))
                     .route("/usuarios/carga-masiva", web::post().to(modules::carga_masiva))
-                    .route("/get_usuario_by_ac/{nacionalidad}/{cedula}", web::get().to(modules::get_usuario_by_ac)),
+                    .route("/get_usuario_by_ac/{nacionalidad}/{cedula}", web::get().to(modules::get_usuario_by_ac))
+                    .route("/roles", web::get().to(modules::get_roles)),
             )
     })
     .bind(("127.0.0.1", 9000))?
