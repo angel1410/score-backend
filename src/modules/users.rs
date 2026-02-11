@@ -3,7 +3,6 @@ use sqlx::FromRow;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use log;
-use rand::Rng;
 use crate::structs::AppState;
 
 #[derive(FromRow, Serialize, Deserialize, Debug)]
@@ -17,6 +16,7 @@ pub struct Usuario {
     pub password: String,
     pub activo: i32,
     pub expired: i32,
+    pub id_rol: i32,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -44,8 +44,7 @@ pub struct UsuarioConPassword {
     pub password_generada: String,
 }
 
-fn generar_login(nombre: &str, apellido: &str, cedula: i32) -> String {
-    // ✅ CORREGIDO: inicial nombre + apellido COMPLETO + cedula
+fn generar_login(nombre: &str, apellido: &str, _cedula: i32) -> String {
     let inicial_nombre = nombre
         .chars()
         .next()
@@ -54,24 +53,43 @@ fn generar_login(nombre: &str, apellido: &str, cedula: i32) -> String {
     
     let apellido_limpio = apellido.trim().to_lowercase();
     
-    format!("{}{}{}", inicial_nombre, apellido_limpio, cedula)
+    format!("{}{}", inicial_nombre, apellido_limpio)
 }
 
-fn generar_password() -> String {
-    const CARACTERES: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
-    (0..8).map(|_| {
-        let idx = rng.gen_range(0..CARACTERES.len());
-        CARACTERES[idx] as char
-    }).collect()
+fn generar_password(nombre: &str, apellido: &str, cedula: i32) -> String {
+    let inicial_nombre = nombre
+        .chars()
+        .next()
+        .map(|c| c.to_lowercase().to_string())
+        .unwrap_or_default();
+    
+    let inicial_apellido = apellido
+        .chars()
+        .next()
+        .map(|c| c.to_lowercase().to_string())
+        .unwrap_or_default();
+    
+    format!("{}{}{}", inicial_nombre, inicial_apellido, cedula)
 }
 
 pub async fn get_usuarios(
     app_state: web::Data<AppState>,
 ) -> impl Responder {
     match sqlx::query_as::<_, Usuario>(
-        "SELECT id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired 
-         FROM usuario ORDER BY id DESC"
+        "SELECT 
+            u.id, 
+            u.nacionalidad, 
+            u.cedula, 
+            u.nombre, 
+            u.apellido, 
+            u.login, 
+            u.password, 
+            u.activo, 
+            u.expired,
+            COALESCE(ru.id_rol, 1) AS id_rol
+         FROM usuario u
+         LEFT JOIN rol_usuario ru ON u.id = ru.id_usuario
+         ORDER BY u.id DESC"
     )
     .fetch_all(&app_state.pool_pg)
     .await
@@ -112,13 +130,13 @@ pub async fn crear_usuario(
     usuario: web::Json<UsuarioCreate>,
 ) -> impl Responder {
     let login = generar_login(&usuario.nombre, &usuario.apellido, usuario.cedula);
-    let password_generada = generar_password();
+    let password_generada = generar_password(&usuario.nombre, &usuario.apellido, usuario.cedula);
     let hashed_password = format!("{:x}", Sha256::digest(password_generada.as_bytes()));
 
     let user = match sqlx::query_as::<_, Usuario>(
         "INSERT INTO usuario (nacionalidad, cedula, nombre, apellido, login, password, activo, expired) 
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
-         RETURNING id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired"
+         RETURNING id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired, 1 AS id_rol"
     )
     .bind(&usuario.nacionalidad)
     .bind(usuario.cedula)
@@ -156,8 +174,11 @@ pub async fn crear_usuario(
         }));
     }
 
+    let mut user_with_rol = user;
+    user_with_rol.id_rol = usuario.id_rol;
+    
     HttpResponse::Created().json(UsuarioConPassword {
-        usuario: user,
+        usuario: user_with_rol,
         password_generada,
     })
 }
@@ -170,7 +191,8 @@ pub async fn actualizar_usuario(
     let user_id = id.into_inner();
 
     let existing_user = match sqlx::query_as::<_, Usuario>(
-        "SELECT id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired 
+        "SELECT id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired, 
+                COALESCE((SELECT id_rol FROM rol_usuario WHERE id_usuario = $1), 1) AS id_rol
          FROM usuario WHERE id = $1"
     )
     .bind(user_id)
@@ -193,12 +215,13 @@ pub async fn actualizar_usuario(
 
     let updated_user = match sqlx::query_as::<_, Usuario>(
         "UPDATE usuario SET password = $1, activo = $2, expired = $3 WHERE id = $4 
-         RETURNING id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired"
+         RETURNING id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired, $5 AS id_rol"
     )
     .bind(&password_to_use)
     .bind(usuario.activo)
     .bind(usuario.expired)
     .bind(user_id)
+    .bind(usuario.id_rol)
     .fetch_one(&app_state.pool_pg)
     .await
     {
@@ -238,7 +261,9 @@ pub async fn bloquear_usuario(
 
     match sqlx::query_as::<_, Usuario>(
         "UPDATE usuario SET activo = CASE WHEN activo = 1 THEN 0 ELSE 1 END 
-         WHERE id = $1 RETURNING id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired"
+         WHERE id = $1 
+         RETURNING id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired, 
+                  COALESCE((SELECT id_rol FROM rol_usuario WHERE id_usuario = $1), 1) AS id_rol"
     )
     .bind(user_id)
     .fetch_one(&app_state.pool_pg)
@@ -255,7 +280,6 @@ pub async fn bloquear_usuario(
     }
 }
 
-// ✅ Carga masiva deshabilitada temporalmente (sin imports innecesarios)
 pub async fn carga_masiva(
     _app_state: web::Data<AppState>,
     _payload: actix_multipart::Multipart,
