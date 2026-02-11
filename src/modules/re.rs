@@ -129,6 +129,7 @@ fn yyyymmdd_to_iso(s: &str) -> Option<String> {
     Some(format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8]))
 }
 
+
 // ✅ helper: siempre 9 dígitos
 fn pad9(n: i64) -> String {
     format!("{:09}", n)
@@ -414,8 +415,6 @@ pub async fn get_elector(
     Ok(HttpResponse::Ok().json(resp))
 }
 
-
-// =====================
 // NUEVO: Lista de electores (para DataTable)
 // GET /get_electores?primer_nombre=...&fecha_nacimiento=YYYY-MM-DD...
 // =====================
@@ -425,13 +424,11 @@ pub struct ElectoresQuery {
     pub nacionalidad: Option<String>,     // V / E (opcional)
     pub cedula: Option<i64>,              // opcional
     pub fecha_nacimiento: Option<String>, // YYYY-MM-DD (opcional)
-
     pub primer_nombre: Option<String>,
     pub segundo_nombre: Option<String>,
     pub primer_apellido: Option<String>,
     pub segundo_apellido: Option<String>,
-
-    pub codigo_centro: Option<String>,    // opcional
+    pub codigo_centro: Option<String>, // opcional
 }
 
 #[derive(serde::Serialize, Default)]
@@ -446,14 +443,86 @@ pub struct ElectorListaItem {
     pub codigo_centro: Option<String>,
 }
 
-
-// "2026-02-09" -> "20260209"
+// "2026-02-09" -> "20260209" (para el WHERE)
 fn iso_to_yyyymmdd(s: &str) -> Option<String> {
-    if s.len() != 10 { return None; }
-    let y = &s[0..4];
-    let m = &s[5..7];
-    let d = &s[8..10];
+    let t = s.trim();
+    if t.len() != 10 { return None; }
+    if t.chars().nth(4) != Some('-') || t.chars().nth(7) != Some('-') { return None; }
+
+    let y = &t[0..4];
+    let m = &t[5..7];
+    let d = &t[8..10];
+
+    if !y.chars().all(|c| c.is_ascii_digit()) { return None; }
+    if !m.chars().all(|c| c.is_ascii_digit()) { return None; }
+    if !d.chars().all(|c| c.is_ascii_digit()) { return None; }
+
+    let mm: u32 = m.parse().ok()?;
+    let dd: u32 = d.parse().ok()?;
+    if !(1..=12).contains(&mm) || !(1..=31).contains(&dd) { return None; }
+
     Some(format!("{y}{m}{d}"))
+}
+
+// Normaliza FECHA a "YYYY-MM-DD" (evita 1960--1-0-)
+fn normalize_date(input: Option<&str>) -> Option<String> {
+    let s = input?.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // ✅ evita E0716: guardamos el String en una variable viva
+    let binding = s
+        .replace("--", "-")
+        .replace("- -", "-")
+        .replace("  ", " ")
+        .replace("/", "-");
+    let clean = binding.trim();
+
+    // Caso 1: YYYY-MM-DD (aunque venga sin ceros)
+    if clean.contains('-') {
+        let parts: Vec<&str> = clean.split('-').filter(|p| !p.is_empty()).collect();
+        if parts.len() >= 3 {
+            let y = parts[0];
+            let m = parts[1];
+            let d = parts[2];
+
+            if y.len() == 4 && y.chars().all(|c| c.is_ascii_digit()) {
+                let mm: u32 = m.parse().ok()?;
+                let dd: u32 = d.parse().ok()?;
+                if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
+                    return Some(format!("{y}-{:02}-{:02}", mm, dd));
+                }
+            }
+        }
+    }
+
+    // Caso 2: YYYYMMDD
+    if clean.len() == 8 && clean.chars().all(|c| c.is_ascii_digit()) {
+        let y = &clean[0..4];
+        let m = &clean[4..6];
+        let d = &clean[6..8];
+        let mm: u32 = m.parse().ok()?;
+        let dd: u32 = d.parse().ok()?;
+        if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
+            return Some(format!("{y}-{m}-{d}"));
+        }
+    }
+
+    // Caso 3: extraer 8 dígitos seguidos
+    let digits: String = clean.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 8 {
+        let y = &digits[0..4];
+        let m = &digits[4..6];
+        let d = &digits[6..8];
+        let mm: u32 = m.parse().ok()?;
+        let dd: u32 = d.parse().ok()?;
+        if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
+            return Some(format!("{y}-{m}-{d}"));
+        }
+    }
+
+    None
 }
 
 pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResponse, Error> {
@@ -462,32 +531,53 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
     // 1) Validar: al menos 1 dato
     let hay_dato =
         q.cedula.is_some()
-        || q.fecha_nacimiento.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-        || q.primer_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-        || q.segundo_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-        || q.primer_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-        || q.segundo_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-        || q.codigo_centro.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-        || q.nacionalidad.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+            || q.fecha_nacimiento
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            || q.primer_nombre
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            || q.segundo_nombre
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            || q.primer_apellido
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            || q.segundo_apellido
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            || q.codigo_centro
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            || q.nacionalidad
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
 
     if !hay_dato {
         return Err(actix_web::error::ErrorBadRequest("Ingrese al menos un dato"));
     }
 
-    // 2) Conexión Oracle (debe existir en este scope)
-    let conn = oracle_conn()
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e)))?;
+    // 2) Conexión Oracle
+    let conn = oracle_conn().map_err(|e| {
+        actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e))
+    })?;
 
     // 3) FROM + WHERE reutilizable
-    let mut from_where = String::from(r#"
-        FROM AC AC
-        LEFT JOIN instrumentos.cuaderno_actual2 CA
-          ON CA.CO_NACIONALIDAD = AC.NACIONALIDAD
-         AND CA.NU_CEDULA = AC.CEDULA
+    let mut from_where = String::from(
+        r#"
+        FROM V_RE_ACTUAL_CVA
         WHERE 1=1
-    "#);
+    "#,
+    );
 
-    // 4) binds (deben existir en este scope)
+    // 4) binds
     let mut binds_str: Vec<(String, String)> = vec![];
     let mut binds_i64: Vec<(String, i64)> = vec![];
 
@@ -498,7 +588,7 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
     // 5) filtros
     if let Some(nac) = q.nacionalidad.as_ref().map(|x| x.trim().to_uppercase()) {
         if nac == "V" || nac == "E" {
-            from_where.push_str(" AND AC.NACIONALIDAD = :nacionalidad ");
+            from_where.push_str(" AND NACIONALIDAD = :nacionalidad ");
             binds_str.push(("nacionalidad".into(), nac));
         }
     }
@@ -507,10 +597,11 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         if ced <= 0 || ced > 99_999_999 {
             return Err(actix_web::error::ErrorBadRequest("cedula inválida"));
         }
-        from_where.push_str(" AND AC.CEDULA = :cedula ");
+        from_where.push_str(" AND CEDULA = :cedula ");
         binds_i64.push(("cedula".into(), ced));
     }
 
+    // ✅ filtro fecha: UI manda YYYY-MM-DD, Oracle guarda YYYYMMDD
     if let Some(fnac_iso) = q
         .fecha_nacimiento
         .as_ref()
@@ -519,36 +610,36 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
     {
         let yyyymmdd = iso_to_yyyymmdd(fnac_iso)
             .ok_or_else(|| actix_web::error::ErrorBadRequest("fecha_nacimiento inválida (YYYY-MM-DD)"))?;
-        from_where.push_str(" AND AC.FECHA_NACIMIENTO_4 = :fecha_nacimiento ");
+        from_where.push_str(" AND FECHA = :fecha_nacimiento ");
         binds_str.push(("fecha_nacimiento".into(), yyyymmdd));
     }
 
     if let Some(s) = q.primer_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND UPPER(AC.PRIMER_NOMBRE) = :primer_nombre ");
+        from_where.push_str(" AND UPPER(PRIMER_NOMBRE) = :primer_nombre ");
         binds_str.push(("primer_nombre".into(), eq_param(s)));
     }
 
     if let Some(s) = q.segundo_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND UPPER(AC.SEGUNDO_NOMBRE) = :segundo_nombre ");
+        from_where.push_str(" AND UPPER(SEGUNDO_NOMBRE) = :segundo_nombre ");
         binds_str.push(("segundo_nombre".into(), eq_param(s)));
     }
 
     if let Some(s) = q.primer_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND UPPER(AC.PRIMER_APELLIDO) = :primer_apellido ");
+        from_where.push_str(" AND UPPER(PRIMER_APELLIDO) = :primer_apellido ");
         binds_str.push(("primer_apellido".into(), eq_param(s)));
     }
 
     if let Some(s) = q.segundo_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND UPPER(AC.SEGUNDO_APELLIDO) = :segundo_apellido ");
+        from_where.push_str(" AND UPPER(SEGUNDO_APELLIDO) = :segundo_apellido ");
         binds_str.push(("segundo_apellido".into(), eq_param(s)));
     }
 
     if let Some(s) = q.codigo_centro.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND TO_CHAR(CA.NU_CENTRO) = :codigo_centro ");
+        from_where.push_str(" AND TO_CHAR(CODIGO_CENTRO_VOTACION) = :codigo_centro ");
         binds_str.push(("codigo_centro".into(), s.to_string()));
     }
 
-    // 6) params (deben existir en este scope)
+    // 6) params
     let mut params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
     for (k, v) in &binds_str {
         params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
@@ -557,39 +648,45 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
     }
 
-    // 7) SELECT (sin paginado)
-    let sql_select = format!(r#"
-        SELECT
-          AC.NACIONALIDAD,
-          AC.CEDULA,
-          AC.FECHA_NACIMIENTO_4,
-          AC.PRIMER_NOMBRE,
-          AC.SEGUNDO_NOMBRE,
-          AC.PRIMER_APELLIDO,
-          AC.SEGUNDO_APELLIDO,
-          CA.NU_CENTRO
-        {}
-        ORDER BY AC.CEDULA
-    "#, from_where);
+    // 7) SELECT
+    let sql_select = format!(
+        r#"
+    SELECT 
+        NACIONALIDAD, 
+        CEDULA, 
+        PRIMER_NOMBRE, 
+        SEGUNDO_NOMBRE, 
+        PRIMER_APELLIDO, 
+        SEGUNDO_APELLIDO, 
+        FECHA, 
+        CODIGO_CENTRO_VOTACION
+    {}
+    ORDER BY CEDULA
+    "#,
+        from_where
+    );
 
     let t1 = Instant::now();
-    let mut rows_data = conn
-        .query_named(&sql_select, &params)
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error SELECT: {}", e)))?;
+    let mut rows_data = conn.query_named(&sql_select, &params).map_err(|e| {
+        actix_web::error::ErrorInternalServerError(format!("Error SELECT: {}", e))
+    })?;
     println!("get_electores SELECT ms = {}", t1.elapsed().as_millis());
 
     let mut items: Vec<ElectorListaItem> = Vec::new();
 
-    while let Some(row) = rows_data
-        .next()
-        .transpose()
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error leyendo filas: {}", e)))?
-    {
+    while let Some(row) = rows_data.next().transpose().map_err(|e| {
+        actix_web::error::ErrorInternalServerError(format!("Error leyendo filas: {}", e))
+    })? {
         let nac: String = row.get(0).unwrap_or_else(|_| "V".to_string());
         let ced: i64 = row.get(1).unwrap_or(0);
 
-        let fecha_raw: Option<String> = row.get(2).ok();
-        let fecha_iso = fecha_raw.as_deref().and_then(yyyymmdd_to_iso);
+        let primer_nombre: Option<String> = row.get(2).ok();
+        let segundo_nombre: Option<String> = row.get(3).ok();
+        let primer_apellido: Option<String> = row.get(4).ok();
+        let segundo_apellido: Option<String> = row.get(5).ok();
+
+        let fecha_raw: Option<String> = row.get(6).ok();
+        let fecha_iso = normalize_date(fecha_raw.as_deref());
 
         let centro_num: Option<i64> = row.get(7).ok();
         let codigo_centro = centro_num.map(|x| format!("{:0>9}", x));
@@ -598,10 +695,10 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
             nacionalidad: nac,
             cedula: ced,
             fecha_nacimiento: fecha_iso,
-            primer_nombre: row.get(3).ok(),
-            segundo_nombre: row.get(4).ok(),
-            primer_apellido: row.get(5).ok(),
-            segundo_apellido: row.get(6).ok(),
+            primer_nombre,
+            segundo_nombre,
+            primer_apellido,
+            segundo_apellido,
             codigo_centro,
         });
     }
