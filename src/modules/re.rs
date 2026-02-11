@@ -432,9 +432,6 @@ pub struct ElectoresQuery {
     pub segundo_apellido: Option<String>,
 
     pub codigo_centro: Option<String>,    // opcional
-
-    pub first: Option<u32>, // offset
-    pub rows: Option<u32>,  // limit
 }
 
 #[derive(serde::Serialize, Default)]
@@ -449,12 +446,6 @@ pub struct ElectorListaItem {
     pub codigo_centro: Option<String>,
 }
 
-#[derive(serde::Serialize)]
-pub struct PagedResponse<T> {
-    pub items: Vec<T>,
-    pub total: i64,
-}
-
 
 // "2026-02-09" -> "20260209"
 fn iso_to_yyyymmdd(s: &str) -> Option<String> {
@@ -465,15 +456,8 @@ fn iso_to_yyyymmdd(s: &str) -> Option<String> {
     Some(format!("{y}{m}{d}"))
 }
 
-pub async fn get_electores(
-    query: web::Query<ElectoresQuery>,
-) -> Result<HttpResponse, Error> {
+pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResponse, Error> {
     let q = query.into_inner();
-
-    let t_all = Instant::now();
-
-    let first = q.first.unwrap_or(0) as i64; // offset
-    let rows  = q.rows.unwrap_or(10) as i64; // page size
 
     // 1) Validar: al menos 1 dato
     let hay_dato =
@@ -490,7 +474,7 @@ pub async fn get_electores(
         return Err(actix_web::error::ErrorBadRequest("Ingrese al menos un dato"));
     }
 
-    // 2) Conexión Oracle
+    // 2) Conexión Oracle (debe existir en este scope)
     let conn = oracle_conn()
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e)))?;
 
@@ -503,7 +487,7 @@ pub async fn get_electores(
         WHERE 1=1
     "#);
 
-    // 4) binds
+    // 4) binds (deben existir en este scope)
     let mut binds_str: Vec<(String, String)> = vec![];
     let mut binds_i64: Vec<(String, i64)> = vec![];
 
@@ -527,7 +511,12 @@ pub async fn get_electores(
         binds_i64.push(("cedula".into(), ced));
     }
 
-    if let Some(fnac_iso) = q.fecha_nacimiento.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+    if let Some(fnac_iso) = q
+        .fecha_nacimiento
+        .as_ref()
+        .map(|x| x.trim())
+        .filter(|x| !x.is_empty())
+    {
         let yyyymmdd = iso_to_yyyymmdd(fnac_iso)
             .ok_or_else(|| actix_web::error::ErrorBadRequest("fecha_nacimiento inválida (YYYY-MM-DD)"))?;
         from_where.push_str(" AND AC.FECHA_NACIMIENTO_4 = :fecha_nacimiento ");
@@ -559,7 +548,7 @@ pub async fn get_electores(
         binds_str.push(("codigo_centro".into(), s.to_string()));
     }
 
-    // 6) params
+    // 6) params (deben existir en este scope)
     let mut params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
     for (k, v) in &binds_str {
         params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
@@ -568,68 +557,32 @@ pub async fn get_electores(
         params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
     }
 
-    // 7) COUNT (mídelo)
-    let sql_count = format!("SELECT COUNT(*) {}", from_where);
-
-    let t0 = Instant::now();
-    let mut rows_count = conn
-        .query_named(&sql_count, &params)
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error COUNT: {}", e)))?;
-
-    let total: i64 = if let Some(r) = rows_count.next().transpose()
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error leyendo COUNT: {}", e)))?
-    {
-        r.get(0).unwrap_or(0)
-    } else {
-        0
-    };
-    println!("get_electores COUNT ms = {}", t0.elapsed().as_millis());
-
-    // 8) SELECT paginado usando ROW_NUMBER
-    let start_rn = first + 1;
-    let end_rn = first + rows;
-
+    // 7) SELECT (sin paginado)
     let sql_select = format!(r#"
         SELECT
-          NACIONALIDAD,
-          CEDULA,
-          FECHA_NACIMIENTO_4,
-          PRIMER_NOMBRE,
-          SEGUNDO_NOMBRE,
-          PRIMER_APELLIDO,
-          SEGUNDO_APELLIDO,
-          NU_CENTRO
-        FROM (
-          SELECT
-            AC.NACIONALIDAD AS NACIONALIDAD,
-            AC.CEDULA AS CEDULA,
-            AC.FECHA_NACIMIENTO_4 AS FECHA_NACIMIENTO_4,
-            AC.PRIMER_NOMBRE AS PRIMER_NOMBRE,
-            AC.SEGUNDO_NOMBRE AS SEGUNDO_NOMBRE,
-            AC.PRIMER_APELLIDO AS PRIMER_APELLIDO,
-            AC.SEGUNDO_APELLIDO AS SEGUNDO_APELLIDO,
-            CA.NU_CENTRO AS NU_CENTRO,
-            ROW_NUMBER() OVER (ORDER BY AC.CEDULA) AS RN
-          {}
-        )
-        WHERE RN BETWEEN :rn_start AND :rn_end
-        ORDER BY RN
+          AC.NACIONALIDAD,
+          AC.CEDULA,
+          AC.FECHA_NACIMIENTO_4,
+          AC.PRIMER_NOMBRE,
+          AC.SEGUNDO_NOMBRE,
+          AC.PRIMER_APELLIDO,
+          AC.SEGUNDO_APELLIDO,
+          CA.NU_CENTRO
+        {}
+        ORDER BY AC.CEDULA
     "#, from_where);
-
-    let mut params_paged: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
-    params_paged.extend_from_slice(&params);
-    params_paged.push(("rn_start", &start_rn));
-    params_paged.push(("rn_end", &end_rn));
 
     let t1 = Instant::now();
     let mut rows_data = conn
-        .query_named(&sql_select, &params_paged)
+        .query_named(&sql_select, &params)
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error SELECT: {}", e)))?;
     println!("get_electores SELECT ms = {}", t1.elapsed().as_millis());
 
     let mut items: Vec<ElectorListaItem> = Vec::new();
 
-    while let Some(row) = rows_data.next().transpose()
+    while let Some(row) = rows_data
+        .next()
+        .transpose()
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error leyendo filas: {}", e)))?
     {
         let nac: String = row.get(0).unwrap_or_else(|_| "V".to_string());
@@ -653,7 +606,5 @@ pub async fn get_electores(
         });
     }
 
-    println!("get_electores TOTAL ms = {}", t_all.elapsed().as_millis());
-
-    Ok(HttpResponse::Ok().json(PagedResponse { items, total }))
+    Ok(HttpResponse::Ok().json(items))
 }
