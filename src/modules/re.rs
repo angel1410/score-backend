@@ -415,8 +415,10 @@ pub async fn get_elector(
     Ok(HttpResponse::Ok().json(resp))
 }
 
+// =====================
 // NUEVO: Lista de electores (para DataTable)
 // GET /get_electores?primer_nombre=...&fecha_nacimiento=YYYY-MM-DD...
+// FECHA en BD: VARCHAR2(10) formato YYYY-MM-DD
 // =====================
 
 #[derive(Deserialize)]
@@ -424,10 +426,12 @@ pub struct ElectoresQuery {
     pub nacionalidad: Option<String>,     // V / E (opcional)
     pub cedula: Option<i64>,              // opcional
     pub fecha_nacimiento: Option<String>, // YYYY-MM-DD (opcional)
+
     pub primer_nombre: Option<String>,
     pub segundo_nombre: Option<String>,
     pub primer_apellido: Option<String>,
     pub segundo_apellido: Option<String>,
+
     pub codigo_centro: Option<String>, // opcional
 }
 
@@ -443,27 +447,6 @@ pub struct ElectorListaItem {
     pub codigo_centro: Option<String>,
 }
 
-// "2026-02-09" -> "20260209" (para el WHERE)
-fn iso_to_yyyymmdd(s: &str) -> Option<String> {
-    let t = s.trim();
-    if t.len() != 10 { return None; }
-    if t.chars().nth(4) != Some('-') || t.chars().nth(7) != Some('-') { return None; }
-
-    let y = &t[0..4];
-    let m = &t[5..7];
-    let d = &t[8..10];
-
-    if !y.chars().all(|c| c.is_ascii_digit()) { return None; }
-    if !m.chars().all(|c| c.is_ascii_digit()) { return None; }
-    if !d.chars().all(|c| c.is_ascii_digit()) { return None; }
-
-    let mm: u32 = m.parse().ok()?;
-    let dd: u32 = d.parse().ok()?;
-    if !(1..=12).contains(&mm) || !(1..=31).contains(&dd) { return None; }
-
-    Some(format!("{y}{m}{d}"))
-}
-
 // Normaliza FECHA a "YYYY-MM-DD" (evita 1960--1-0-)
 fn normalize_date(input: Option<&str>) -> Option<String> {
     let s = input?.trim();
@@ -471,7 +454,7 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
         return None;
     }
 
-    // ✅ evita E0716: guardamos el String en una variable viva
+    // evita temporales (E0716): guardamos el String
     let binding = s
         .replace("--", "-")
         .replace("- -", "-")
@@ -479,7 +462,7 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
         .replace("/", "-");
     let clean = binding.trim();
 
-    // Caso 1: YYYY-MM-DD (aunque venga sin ceros)
+    // Caso 1: YYYY-MM-DD (aunque venga sin ceros: 1960-7-1)
     if clean.contains('-') {
         let parts: Vec<&str> = clean.split('-').filter(|p| !p.is_empty()).collect();
         if parts.len() >= 3 {
@@ -497,11 +480,12 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
         }
     }
 
-    // Caso 2: YYYYMMDD
+    // Caso 2: YYYYMMDD -> YYYY-MM-DD
     if clean.len() == 8 && clean.chars().all(|c| c.is_ascii_digit()) {
         let y = &clean[0..4];
         let m = &clean[4..6];
         let d = &clean[6..8];
+
         let mm: u32 = m.parse().ok()?;
         let dd: u32 = d.parse().ok()?;
         if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
@@ -515,10 +499,11 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
         let y = &digits[0..4];
         let m = &digits[4..6];
         let d = &digits[6..8];
+
         let mm: u32 = m.parse().ok()?;
         let dd: u32 = d.parse().ok()?;
         if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
-            return Some(format!("{y}-{m}-{d}"));
+            return Some(format!("{y}-{:02}-{:02}", mm, dd));
         }
     }
 
@@ -531,34 +516,13 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
     // 1) Validar: al menos 1 dato
     let hay_dato =
         q.cedula.is_some()
-            || q.fecha_nacimiento
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-            || q.primer_nombre
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-            || q.segundo_nombre
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-            || q.primer_apellido
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-            || q.segundo_apellido
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-            || q.codigo_centro
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-            || q.nacionalidad
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false);
+        || q.fecha_nacimiento.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.primer_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.segundo_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.primer_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.segundo_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.codigo_centro.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.nacionalidad.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
 
     if !hay_dato {
         return Err(actix_web::error::ErrorBadRequest("Ingrese al menos un dato"));
@@ -570,12 +534,10 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
     })?;
 
     // 3) FROM + WHERE reutilizable
-    let mut from_where = String::from(
-        r#"
+    let mut from_where = String::from(r#"
         FROM V_RE_ACTUAL_CVA
         WHERE 1=1
-    "#,
-    );
+    "#);
 
     // 4) binds
     let mut binds_str: Vec<(String, String)> = vec![];
@@ -601,17 +563,13 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         binds_i64.push(("cedula".into(), ced));
     }
 
-    // ✅ filtro fecha: UI manda YYYY-MM-DD, Oracle guarda YYYYMMDD
-    if let Some(fnac_iso) = q
-        .fecha_nacimiento
-        .as_ref()
-        .map(|x| x.trim())
-        .filter(|x| !x.is_empty())
-    {
-        let yyyymmdd = iso_to_yyyymmdd(fnac_iso)
+    // ✅ FECHA en BD: VARCHAR2(10) 'YYYY-MM-DD' -> se compara directo
+    if let Some(fnac_input) = q.fecha_nacimiento.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        let iso = normalize_date(Some(fnac_input))
             .ok_or_else(|| actix_web::error::ErrorBadRequest("fecha_nacimiento inválida (YYYY-MM-DD)"))?;
+
         from_where.push_str(" AND FECHA = :fecha_nacimiento ");
-        binds_str.push(("fecha_nacimiento".into(), yyyymmdd));
+        binds_str.push(("fecha_nacimiento".into(), iso));
     }
 
     if let Some(s) = q.primer_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
@@ -651,18 +609,18 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
     // 7) SELECT
     let sql_select = format!(
         r#"
-    SELECT 
-        NACIONALIDAD, 
-        CEDULA, 
-        PRIMER_NOMBRE, 
-        SEGUNDO_NOMBRE, 
-        PRIMER_APELLIDO, 
-        SEGUNDO_APELLIDO, 
-        FECHA, 
-        CODIGO_CENTRO_VOTACION
-    {}
-    ORDER BY CEDULA
-    "#,
+        SELECT 
+            NACIONALIDAD, 
+            CEDULA, 
+            PRIMER_NOMBRE, 
+            SEGUNDO_NOMBRE, 
+            PRIMER_APELLIDO, 
+            SEGUNDO_APELLIDO, 
+            FECHA, 
+            CODIGO_CENTRO_VOTACION
+        {}
+        ORDER BY CEDULA
+        "#,
         from_where
     );
 
@@ -688,8 +646,8 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         let fecha_raw: Option<String> = row.get(6).ok();
         let fecha_iso = normalize_date(fecha_raw.as_deref());
 
-        let centro_num: Option<i64> = row.get(7).ok();
-        let codigo_centro = centro_num.map(|x| format!("{:0>9}", x));
+        // si CODIGO_CENTRO_VOTACION ya es VARCHAR2(9), puedes leerlo como String
+        let codigo_centro: Option<String> = row.get(7).ok();
 
         items.push(ElectorListaItem {
             nacionalidad: nac,
