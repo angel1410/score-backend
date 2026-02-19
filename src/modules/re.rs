@@ -98,6 +98,7 @@ pub struct ElectorResponse {
     pub segundo_apellido: Option<String>,
     pub codigo_objecion: Option<String>,
     pub descripcion_objecion: Option<String>,
+    pub direccion_elector: Option<String>,
 
     // Sección 2
     pub fecha_ultimo_evento: Option<String>, // YYYY-MM-DD
@@ -157,6 +158,31 @@ fn clean_geo_desc(s: String) -> String {
     t = t.trim_start_matches(|c: char| c == '-' || c == '—' || c == ':' ).trim().to_string();
     t
 }
+
+fn na(v: Option<String>) -> String {
+    let t = v.unwrap_or_default().trim().to_string();
+    if t.is_empty() { "No aplica".to_string() } else { t }
+}
+
+fn build_direccion_elector(
+    ciudad: Option<String>,
+    urbanizacion: Option<String>,
+    sector: Option<String>,
+    avenida_calle: Option<String>,
+    edificio_casa: Option<String>,
+    apartamento: Option<String>,
+) -> String {
+    format!(
+        "CIUDAD: {}, AVENIDA-CALLE: {}, URBANIZACION: {}, SECTOR: {}, EDIFICIO-CASA: {}, APARTAMENTO: {}",
+        na(ciudad),
+        na(avenida_calle),
+        na(urbanizacion),
+        na(sector),
+        na(edificio_casa),
+        na(apartamento),
+    )
+}
+
 
 // ✅ Formato final: "13 - MIRANDA" / "08 - PLAZA" / "01 - GUARENAS"
 fn fmt_geo(code: i64, desc: Option<String>) -> String {
@@ -231,17 +257,26 @@ pub async fn get_elector(
     // ---------------------
     let sql_persona = r#"
         SELECT
-          AC.PRIMER_APELLIDO,
-          AC.SEGUNDO_APELLIDO,
-          AC.PRIMER_NOMBRE,
-          AC.SEGUNDO_NOMBRE,
-          AC.FECHA_NACIMIENTO_4,
-          AC.STATUS_OBJECION,
-          OBJ.DESCRIPCION
-        FROM AC AC
-        JOIN OBJECION OBJ ON AC.STATUS_OBJECION = OBJ.STATUS
-        WHERE AC.NACIONALIDAD = :nacionalidad
-          AND AC.CEDULA = :cedula
+      AC.PRIMER_APELLIDO,
+      AC.SEGUNDO_APELLIDO,
+      AC.PRIMER_NOMBRE,
+      AC.SEGUNDO_NOMBRE,
+      AC.FECHA_NACIMIENTO_4,
+      AC.STATUS_OBJECION,
+      OBJ.DESCRIPCION,
+      MD.CIUDAD,
+      MD.URBANIZACION,
+      MD.SECTOR,
+      MD.AVENIDA_CALLE,
+      MD.EDIFICIO_CASA,
+      MD.APARTAMENTO
+    FROM AC AC
+    JOIN OBJECION OBJ ON AC.STATUS_OBJECION = OBJ.STATUS
+    LEFT JOIN RE.MAESTRO_DIRECCION MD
+      ON MD.NACIONALIDAD = AC.NACIONALIDAD
+     AND MD.CEDULA = AC.CEDULA
+    WHERE AC.NACIONALIDAD = :nacionalidad
+      AND AC.CEDULA = :cedula
     "#;
 
     let mut rows = conn.query(sql_persona, &[&nacionalidad, &cedula])
@@ -266,6 +301,23 @@ pub async fn get_elector(
     let cod_obj: Option<i64> = row.get(5).ok();
     resp.codigo_objecion = cod_obj.map(|x| x.to_string());
     resp.descripcion_objecion = row.get(6).ok();
+
+    // ✅ NUEVO: dirección elector (MAESTRO_DIRECCION)
+let ciudad: Option<String> = row.get(7).ok();
+let urbanizacion: Option<String> = row.get(8).ok();
+let sector: Option<String> = row.get(9).ok();
+let avenida_calle: Option<String> = row.get(10).ok();
+let edificio_casa: Option<String> = row.get(11).ok();
+let apartamento: Option<String> = row.get(12).ok();
+
+resp.direccion_elector = Some(build_direccion_elector(
+    ciudad,
+    urbanizacion,
+    sector,
+    avenida_calle,
+    edificio_casa,
+    apartamento,
+));
 
     // ---------------------
     // 2) instrumentos.cuaderno_actual2
