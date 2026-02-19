@@ -1,6 +1,11 @@
 use actix_web::{web, HttpResponse, Responder};
+use actix_multipart::Multipart;
 use sqlx::FromRow;
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
+use csv::ReaderBuilder;
+use calamine::{DataType as CalamineDataType, Reader, Xls, Xlsx};
+use futures_util::TryStreamExt;
 use sha2::{Sha256, Digest};
 use log;
 use crate::structs::AppState;
@@ -42,6 +47,13 @@ pub struct UsuarioUpdate {
 pub struct UsuarioConPassword {
     pub usuario: Usuario,
     pub password_generada: String,
+}
+
+#[derive(Serialize)]
+pub struct CargaMasivaResultado {
+    pub exitosos: usize,
+    pub fallidos: usize,
+    pub detalles: Vec<String>,
 }
 
 fn generar_login(nombre: &str, apellido: &str, _cedula: i32) -> String {
@@ -280,9 +292,433 @@ pub async fn bloquear_usuario(
     }
 }
 
+// ====== VALIDACIÓN CONTRA TABLA AC DE ORACLE ======
+async fn validar_contra_ac(nacionalidad: &str, cedula: i32) -> Result<bool, String> {
+    use oracle::Connection;
+    use std::env;
+
+    let username = env::var("ORACLE_USER").map_err(|e| format!("ORACLE_USER no configurado: {}", e))?;
+    let password = env::var("ORACLE_PASS").map_err(|e| format!("ORACLE_PASS no configurado: {}", e))?;
+    let oracle_ip = env::var("ORACLE_IP").map_err(|e| format!("ORACLE_IP no configurado: {}", e))?;
+    let oracle_port = env::var("ORACLE_PORT").map_err(|e| format!("ORACLE_PORT no configurado: {}", e))?;
+    let oracle_db = env::var("ORACLE_DB").map_err(|e| format!("ORACLE_DB no configurado: {}", e))?;
+    
+    let connect_string = format!("//{}:{}{}", oracle_ip, oracle_port, oracle_db);
+    
+    let conn = Connection::connect(&username, &password, &connect_string)
+        .map_err(|e| format!("Error conectando a Oracle: {}", e))?;
+
+    let sql = "SELECT 1 FROM RE.AC WHERE NACIONALIDAD = :nacionalidad AND CEDULA = :cedula";
+    
+    let exists = conn
+        .query_row_as::<i32>(sql, &[&nacionalidad, &cedula])
+        .ok()
+        .is_some();
+
+    Ok(exists)
+}
+
+// ====== CARGA MASIVA COMPLETA CON VALIDACIÓN ======
 pub async fn carga_masiva(
-    _app_state: web::Data<AppState>,
-    _payload: actix_multipart::Multipart,
+    app_state: web::Data<AppState>,
+    mut payload: Multipart,
 ) -> impl Responder {
-    HttpResponse::NotImplemented().body("Carga masiva deshabilitada temporalmente")
+    let mut file_buffer = Vec::new();
+    let mut file_name = String::from("unknown");
+
+    while let Ok(Some(mut field)) = payload.try_next().await {
+        if let Some(content_disposition) = field.content_disposition() {
+            if let Some(filename) = content_disposition.get_filename() {
+                file_name = filename.to_string();
+            }
+        }
+
+        while let Some(chunk) = field.try_next().await.unwrap_or(None) {
+            file_buffer.extend_from_slice(&chunk);
+        }
+    }
+
+    if file_buffer.is_empty() {
+        return HttpResponse::BadRequest().body("No se recibió archivo");
+    }
+
+    if file_buffer.len() > 5_000_000 {
+        return HttpResponse::BadRequest().body("Archivo excede 5MB");
+    }
+
+    let result = if file_name.ends_with(".csv") {
+        process_csv(&file_buffer, app_state).await
+    } else if file_name.ends_with(".xlsx") {
+        process_excel_xlsx(&file_buffer, app_state).await
+    } else if file_name.ends_with(".xls") {
+        process_excel_xls(&file_buffer, app_state).await
+    } else {
+        return HttpResponse::BadRequest().body("Formato no soportado. Use .csv, .xlsx o .xls");
+    };
+
+    match result {
+        Ok(res) => HttpResponse::Ok().json(res),
+        Err(e) => {
+            log::error!("Error en carga masiva: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Error procesando archivo",
+                "details": e
+            }))
+        }
+    }
+}
+
+async fn process_csv(
+    buffer: &[u8], 
+    app_state: web::Data<AppState>
+) -> Result<CargaMasivaResultado, String> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(Cursor::new(buffer));
+    
+    let mut exitosos = 0;
+    let mut fallidos = 0;
+    let mut detalles = Vec::new();
+
+    for (idx, result) in reader.records().enumerate() {
+        let record = result.map_err(|e| format!("Error leyendo CSV línea {}: {}", idx + 2, e))?;
+        
+        if record.len() < 7 {
+            fallidos += 1;
+            detalles.push(format!("Línea {}: Columnas insuficientes (se esperan 7)", idx + 2));
+            continue;
+        }
+
+        let nacionalidad = record.get(0).unwrap_or("").trim().to_string();
+        let cedula: i32 = record.get(1).unwrap_or("0").trim().parse().unwrap_or(0);
+        let nombre = record.get(2).unwrap_or("").trim().to_string();
+        let apellido = record.get(3).unwrap_or("").trim().to_string();
+        let id_rol: i32 = record.get(4).unwrap_or("0").trim().parse().unwrap_or(0);
+        let activo: i32 = record.get(5).unwrap_or("1").trim().parse().unwrap_or(1);
+        let expired: i32 = record.get(6).unwrap_or("0").trim().parse().unwrap_or(0);
+
+        // ✅ Validar contra AC
+        match validar_contra_ac(&nacionalidad, cedula).await {
+            Ok(exists) => {
+                if !exists {
+                    fallidos += 1;
+                    detalles.push(format!(
+                        "Línea {}: Cédula {}-{} no existe en registro electoral",
+                        idx + 2, nacionalidad, cedula
+                    ));
+                    continue;
+                }
+            }
+            Err(e) => {
+                fallidos += 1;
+                detalles.push(format!(
+                    "Línea {}: Error validando en AC: {}",
+                    idx + 2, e
+                ));
+                continue;
+            }
+        }
+
+        // ✅ Crear usuario
+        let login = generar_login(&nombre, &apellido, cedula);
+        let password = generar_password(&nombre, &apellido, cedula);
+        let hashed_password = format!("{:x}", Sha256::digest(password.as_bytes()));
+        
+        let tx_result = sqlx::query(
+            "INSERT INTO usuario (nacionalidad, cedula, nombre, apellido, login, password, activo, expired) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (login) DO NOTHING
+             RETURNING id"
+        )
+        .bind(&nacionalidad)
+        .bind(cedula)
+        .bind(&nombre)
+        .bind(&apellido)
+        .bind(&login)
+        .bind(&hashed_password)
+        .bind(activo)
+        .bind(expired)
+        .fetch_optional(&app_state.pool_pg)
+        .await;
+
+        match tx_result {
+            Ok(Some(_)) => {
+                // ✅ Obtener ID del usuario creado
+                if let Ok(user_id) = sqlx::query_scalar::<_, i32>(
+                    "SELECT id FROM usuario WHERE login = $1"
+                )
+                .bind(&login)
+                .fetch_one(&app_state.pool_pg)
+                .await
+                {
+                    // ✅ Insertar en rol_usuario
+                    let _ = sqlx::query(
+                        "INSERT INTO rol_usuario (id_rol, id_usuario) VALUES ($1, $2)
+                         ON CONFLICT (id_usuario) DO UPDATE SET id_rol = $1"
+                    )
+                    .bind(id_rol)
+                    .bind(user_id)
+                    .execute(&app_state.pool_pg)
+                    .await;
+                    
+                    exitosos += 1;
+                    detalles.push(format!(
+                        "Línea {}: Usuario {} creado exitosamente (login: {})",
+                        idx + 2, nombre, login
+                    ));
+                } else {
+                    fallidos += 1;
+                    detalles.push(format!(
+                        "Línea {}: No se pudo obtener ID del usuario {}", 
+                        idx + 2, nombre
+                    ));
+                }
+            }
+            Ok(None) => {
+                fallidos += 1;
+                detalles.push(format!(
+                    "Línea {}: Login '{}' ya existe (usuario duplicado)",
+                    idx + 2, login
+                ));
+            }
+            Err(e) => {
+                fallidos += 1;
+                detalles.push(format!(
+                    "Línea {}: Error creando usuario {}: {}",
+                    idx + 2, nombre, e
+                ));
+            }
+        }
+    }
+
+    Ok(CargaMasivaResultado {
+        exitosos,
+        fallidos,
+        detalles,
+    })
+}
+
+async fn process_excel_xlsx(
+    buffer: &[u8], 
+    app_state: web::Data<AppState>
+) -> Result<CargaMasivaResultado, String> {
+    let cursor = Cursor::new(buffer.to_vec());
+    let mut workbook = Xlsx::new(cursor)
+        .map_err(|e| format!("Error abriendo archivo XLSX: {}", e))?;
+
+    let sheet_names = workbook.sheet_names();
+    if sheet_names.is_empty() {
+        return Err("No se encontraron hojas en el archivo XLSX".to_string());
+    }
+
+    // ✅ CORREGIDO: worksheet_range devuelve Result<Range, _>, NO Option<Range>
+    let range = workbook
+        .worksheet_range(&sheet_names[0])
+        .map_err(|e| format!("Error al leer hoja XLSX: {}", e))?;
+
+    process_excel_range(range, app_state).await
+}
+
+async fn process_excel_xls(
+    buffer: &[u8], 
+    app_state: web::Data<AppState>
+) -> Result<CargaMasivaResultado, String> {
+    let cursor = Cursor::new(buffer.to_vec());
+    let mut workbook = Xls::new(cursor)
+        .map_err(|e| format!("Error abriendo archivo XLS: {}", e))?;
+
+    let sheet_names = workbook.sheet_names();
+    if sheet_names.is_empty() {
+        return Err("No se encontraron hojas en el archivo XLS".to_string());
+    }
+
+    // ✅ CORREGIDO: worksheet_range devuelve Result<Range, _>, NO Option<Range>
+    let range = workbook
+        .worksheet_range(&sheet_names[0])
+        .map_err(|e| format!("Error al leer hoja XLS: {}", e))?;
+
+    process_excel_range(range, app_state).await
+}
+
+async fn process_excel_range(
+    range: calamine::Range<CalamineDataType>,
+    app_state: web::Data<AppState>,
+) -> Result<CargaMasivaResultado, String> {
+    let mut exitosos = 0;
+    let mut fallidos = 0;
+    let mut detalles = Vec::new();
+    let mut row_idx = 0;
+
+    // ✅ CORREGIDO: Iterar directamente sobre las filas del rango
+    for row in range.rows() {
+        if row_idx == 0 {
+            row_idx += 1;
+            continue; // Saltar headers
+        }
+
+        if row.len() < 7 {
+            fallidos += 1;
+            detalles.push(format!("Fila {}: Columnas insuficientes", row_idx + 1));
+            row_idx += 1;
+            continue;
+        }
+
+        // ✅ Calamine 0.23: Float es &f64, String es &str
+        let nacionalidad = match &row[0] {
+            CalamineDataType::String(s) => s.trim().to_string(),
+            CalamineDataType::Empty => "".to_string(),
+            _ => "".to_string(),
+        };
+
+        let cedula = match &row[1] {
+            CalamineDataType::Float(f) => *f as i32,  // ✅ *f porque es &f64
+            CalamineDataType::String(s) => s.trim().parse().unwrap_or(0),
+            CalamineDataType::Empty => 0,
+            _ => 0,
+        };
+
+        let nombre = match &row[2] {
+            CalamineDataType::String(s) => s.trim().to_string(),
+            CalamineDataType::Empty => "".to_string(),
+            _ => "".to_string(),
+        };
+
+        let apellido = match &row[3] {
+            CalamineDataType::String(s) => s.trim().to_string(),
+            CalamineDataType::Empty => "".to_string(),
+            _ => "".to_string(),
+        };
+
+        let id_rol = match &row[4] {
+            CalamineDataType::Float(f) => *f as i32,
+            CalamineDataType::String(s) => s.trim().parse().unwrap_or(0),
+            CalamineDataType::Empty => 0,
+            _ => 0,
+        };
+
+        let activo = match &row[5] {
+            CalamineDataType::Float(f) => *f as i32,
+            CalamineDataType::String(s) => s.trim().parse().unwrap_or(1),
+            CalamineDataType::Empty => 1,
+            _ => 1,
+        };
+
+        let expired = match &row[6] {
+            CalamineDataType::Float(f) => *f as i32,
+            CalamineDataType::String(s) => s.trim().parse().unwrap_or(0),
+            CalamineDataType::Empty => 0,
+            _ => 0,
+        };
+
+        if nacionalidad.is_empty() || cedula == 0 || nombre.is_empty() || id_rol == 0 {
+            fallidos += 1;
+            detalles.push(format!(
+                "Fila {}: Datos incompletos (nacionalidad, cédula, nombre o rol requeridos)",
+                row_idx + 1
+            ));
+            row_idx += 1;
+            continue;
+        }
+
+        // ✅ Validar contra AC
+        match validar_contra_ac(&nacionalidad, cedula).await {
+            Ok(exists) => {
+                if !exists {
+                    fallidos += 1;
+                    detalles.push(format!(
+                        "Fila {}: Cédula {}-{} no existe en registro electoral",
+                        row_idx + 1, nacionalidad, cedula
+                    ));
+                    row_idx += 1;
+                    continue;
+                }
+            }
+            Err(e) => {
+                fallidos += 1;
+                detalles.push(format!(
+                    "Fila {}: Error validando en AC: {}",
+                    row_idx + 1, e
+                ));
+                row_idx += 1;
+                continue;
+            }
+        }
+
+        // ✅ Crear usuario
+        let login = generar_login(&nombre, &apellido, cedula);
+        let password = generar_password(&nombre, &apellido, cedula);
+        let hashed_password = format!("{:x}", Sha256::digest(password.as_bytes()));
+        
+        let tx_result = sqlx::query(
+            "INSERT INTO usuario (nacionalidad, cedula, nombre, apellido, login, password, activo, expired) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (login) DO NOTHING
+             RETURNING id"
+        )
+        .bind(&nacionalidad)
+        .bind(cedula)
+        .bind(&nombre)
+        .bind(&apellido)
+        .bind(&login)
+        .bind(&hashed_password)
+        .bind(activo)
+        .bind(expired)
+        .fetch_optional(&app_state.pool_pg)
+        .await;
+
+        match tx_result {
+            Ok(Some(_)) => {
+                if let Ok(user_id) = sqlx::query_scalar::<_, i32>(
+                    "SELECT id FROM usuario WHERE login = $1"
+                )
+                .bind(&login)
+                .fetch_one(&app_state.pool_pg)
+                .await
+                {
+                    let _ = sqlx::query(
+                        "INSERT INTO rol_usuario (id_rol, id_usuario) VALUES ($1, $2)
+                         ON CONFLICT (id_usuario) DO UPDATE SET id_rol = $1"
+                    )
+                    .bind(id_rol)
+                    .bind(user_id)
+                    .execute(&app_state.pool_pg)
+                    .await;
+                    
+                    exitosos += 1;
+                    detalles.push(format!(
+                        "Fila {}: Usuario {} creado exitosamente (login: {})",
+                        row_idx + 1, nombre, login
+                    ));
+                } else {
+                    fallidos += 1;
+                    detalles.push(format!(
+                        "Fila {}: No se pudo obtener ID del usuario {}",
+                        row_idx + 1, nombre
+                    ));
+                }
+            }
+            Ok(None) => {
+                fallidos += 1;
+                detalles.push(format!(
+                    "Fila {}: Login '{}' ya existe (usuario duplicado)",
+                    row_idx + 1, login
+                ));
+            }
+            Err(e) => {
+                fallidos += 1;
+                detalles.push(format!(
+                    "Fila {}: Error creando usuario {}: {}",
+                    row_idx + 1, nombre, e
+                ));
+            }
+        }
+
+        row_idx += 1;
+    }
+
+    Ok(CargaMasivaResultado {
+        exitosos,
+        fallidos,
+        detalles,
+    })
 }

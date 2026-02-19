@@ -32,6 +32,11 @@ mod modules {
 async fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::init();
+    let _oracle_user = env::var("ORACLE_USER").expect("ORACLE_USER faltante");
+    let _oracle_pass = env::var("ORACLE_PASS").expect("ORACLE_PASS faltante");
+    let _oracle_ip = env::var("ORACLE_IP").expect("ORACLE_IP faltante");
+    let _oracle_port = env::var("ORACLE_PORT").expect("ORACLE_PORT faltante");
+    let _oracle_db = env::var("ORACLE_DB").expect("ORACLE_DB faltante");
 
     let allowed_origin =
         env::var("ALLOWED_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".to_string());
