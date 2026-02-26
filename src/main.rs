@@ -1,5 +1,5 @@
+// main.rs
 #![allow(non_snake_case)]
-
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer};
 use dotenvy::dotenv;
@@ -23,9 +23,13 @@ mod modules {
     pub mod users;
 
     pub use login::get_login;
-    pub use re::{get_movimientos_re, get_elector, get_electores}; // ✅ agregado get_elector
-    pub use users::{get_usuarios, crear_usuario, actualizar_usuario, bloquear_usuario, carga_masiva, get_roles};
-    pub use ac::{get_usuario_by_ac}; // ✅ agregado get_usuario_by_ac
+    pub use re::{get_movimientos_re, get_elector, get_electores, get_votos_emitir}; // ✅ NUEVO
+    pub use users::{
+        get_usuarios, crear_usuario, actualizar_usuario, bloquear_usuario,
+        eliminar_usuario,
+        carga_masiva, get_roles
+    };
+    pub use ac::get_usuario_by_ac;
 }
 
 #[actix_web::main]
@@ -72,14 +76,17 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::scope("/api")
                     .route("/login", web::post().to(modules::get_login))
-                    .route(
-                        "/get-movimientos-re/{nacionalidad}/{cedula}",
-                        web::get().to(modules::get_movimientos_re),)
+                    .route("/get-movimientos-re/{nacionalidad}/{cedula}", web::get().to(modules::get_movimientos_re))
                     .route("/get_elector", web::get().to(modules::get_elector))
                     .route("/get_electores", web::get().to(modules::get_electores))
+
+                    // ✅ NUEVO: Votos a emitir (Subsección 2)
+                    .route("/get_votos_emitir/{nacionalidad}/{cedula}", web::get().to(modules::get_votos_emitir))
+
                     .route("/usuarios", web::get().to(modules::get_usuarios))
                     .route("/usuarios", web::post().to(modules::crear_usuario))
                     .route("/usuarios/{id}", web::put().to(modules::actualizar_usuario))
+                    .route("/usuarios/{id}", web::delete().to(modules::eliminar_usuario))
                     .route("/usuarios/{id}/bloquear", web::put().to(modules::bloquear_usuario))
                     .route("/usuarios/carga-masiva", web::post().to(modules::carga_masiva))
                     .route("/get_usuario_by_ac/{nacionalidad}/{cedula}", web::get().to(modules::get_usuario_by_ac))

@@ -1,3 +1,4 @@
+// users.rs
 use actix_web::{web, HttpResponse, Responder};
 use actix_multipart::Multipart;
 use sqlx::FromRow;
@@ -62,9 +63,9 @@ fn generar_login(nombre: &str, apellido: &str, _cedula: i32) -> String {
         .next()
         .map(|c| c.to_lowercase().to_string())
         .unwrap_or_default();
-    
+
     let apellido_limpio = apellido.trim().to_lowercase();
-    
+
     format!("{}{}", inicial_nombre, apellido_limpio)
 }
 
@@ -74,14 +75,37 @@ fn generar_password(nombre: &str, apellido: &str, cedula: i32) -> String {
         .next()
         .map(|c| c.to_lowercase().to_string())
         .unwrap_or_default();
-    
+
     let inicial_apellido = apellido
         .chars()
         .next()
         .map(|c| c.to_lowercase().to_string())
         .unwrap_or_default();
-    
+
     format!("{}{}{}", inicial_nombre, inicial_apellido, cedula)
+}
+
+// ✅ VALIDACIÓN lógica (sin tocar DB): no duplicar por nacionalidad+cedula
+async fn existe_usuario_por_cedula(
+    app_state: &AppState,
+    nacionalidad: &str,
+    cedula: i32,
+) -> Result<bool, sqlx::Error> {
+    let exists = sqlx::query_scalar::<_, i32>(
+        r#"
+        SELECT 1
+        FROM usuario
+        WHERE nacionalidad = $1 AND cedula = $2
+        LIMIT 1
+        "#
+    )
+    .bind(nacionalidad)
+    .bind(cedula)
+    .fetch_optional(&app_state.pool_pg)
+    .await?
+    .is_some();
+
+    Ok(exists)
 }
 
 pub async fn get_usuarios(
@@ -137,12 +161,35 @@ pub async fn get_roles(
     }
 }
 
+// ✅ Crear usuario con validación de cédula duplicada (409)
 pub async fn crear_usuario(
     app_state: web::Data<AppState>,
     usuario: web::Json<UsuarioCreate>,
 ) -> impl Responder {
-    let login = generar_login(&usuario.nombre, &usuario.apellido, usuario.cedula);
-    let password_generada = generar_password(&usuario.nombre, &usuario.apellido, usuario.cedula);
+    let nacionalidad = usuario.nacionalidad.trim().to_uppercase();
+    let cedula = usuario.cedula;
+
+    if !(nacionalidad == "V" || nacionalidad == "E") {
+        return HttpResponse::BadRequest().body("nacionalidad debe ser V o E");
+    }
+    if cedula <= 0 || cedula > 99_999_999 {
+        return HttpResponse::BadRequest().body("cedula inválida");
+    }
+
+    match existe_usuario_por_cedula(&app_state, &nacionalidad, cedula).await {
+        Ok(true) => return HttpResponse::Conflict().body("Ya existe un usuario con esa cédula"),
+        Ok(false) => {}
+        Err(e) => {
+            log::error!("Error validando duplicado por cédula: {}", e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Database error",
+                "details": e.to_string()
+            }));
+        }
+    }
+
+    let login = generar_login(&usuario.nombre, &usuario.apellido, cedula);
+    let password_generada = generar_password(&usuario.nombre, &usuario.apellido, cedula);
     let hashed_password = format!("{:x}", Sha256::digest(password_generada.as_bytes()));
 
     let user = match sqlx::query_as::<_, Usuario>(
@@ -150,8 +197,8 @@ pub async fn crear_usuario(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) 
          RETURNING id, nacionalidad, cedula, nombre, apellido, login, password, activo, expired, 1 AS id_rol"
     )
-    .bind(&usuario.nacionalidad)
-    .bind(usuario.cedula)
+    .bind(&nacionalidad)
+    .bind(cedula)
     .bind(&usuario.nombre)
     .bind(&usuario.apellido)
     .bind(&login)
@@ -188,7 +235,7 @@ pub async fn crear_usuario(
 
     let mut user_with_rol = user;
     user_with_rol.id_rol = usuario.id_rol;
-    
+
     HttpResponse::Created().json(UsuarioConPassword {
         usuario: user_with_rol,
         password_generada,
@@ -292,6 +339,83 @@ pub async fn bloquear_usuario(
     }
 }
 
+// ✅ NUEVO: ELIMINAR USUARIO (con transacción)
+// - borra rol_usuario primero
+// - luego borra usuario
+pub async fn eliminar_usuario(
+    app_state: web::Data<AppState>,
+    id: web::Path<i32>,
+) -> impl Responder {
+    let user_id = id.into_inner();
+
+    // Verificar existencia
+    let exists = match sqlx::query_scalar::<_, i32>("SELECT 1 FROM usuario WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&app_state.pool_pg)
+        .await
+    {
+        Ok(v) => v.is_some(),
+        Err(e) => {
+            log::error!("Error verificando usuario: {}", e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Database error",
+                "details": e.to_string()
+            }));
+        }
+    };
+
+    if !exists {
+        return HttpResponse::NotFound().body("Usuario no encontrado");
+    }
+
+    let mut tx = match app_state.pool_pg.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("Error iniciando transacción: {}", e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Database error",
+                "details": e.to_string()
+            }));
+        }
+    };
+
+    if let Err(e) = sqlx::query("DELETE FROM rol_usuario WHERE id_usuario = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+    {
+        log::error!("Error eliminando rol_usuario: {}", e);
+        let _ = tx.rollback().await;
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "Error eliminando rol del usuario",
+            "details": e.to_string()
+        }));
+    }
+
+    if let Err(e) = sqlx::query("DELETE FROM usuario WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+    {
+        log::error!("Error eliminando usuario: {}", e);
+        let _ = tx.rollback().await;
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "Error eliminando usuario",
+            "details": e.to_string()
+        }));
+    }
+
+    if let Err(e) = tx.commit().await {
+        log::error!("Error commit delete: {}", e);
+        return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": "Error interno",
+            "details": e.to_string()
+        }));
+    }
+
+    HttpResponse::Ok().body("Usuario eliminado")
+}
+
 // ====== VALIDACIÓN CONTRA TABLA AC DE ORACLE ======
 async fn validar_contra_ac(nacionalidad: &str, cedula: i32) -> Result<bool, String> {
     use oracle::Connection;
@@ -302,14 +426,14 @@ async fn validar_contra_ac(nacionalidad: &str, cedula: i32) -> Result<bool, Stri
     let oracle_ip = env::var("ORACLE_IP").map_err(|e| format!("ORACLE_IP no configurado: {}", e))?;
     let oracle_port = env::var("ORACLE_PORT").map_err(|e| format!("ORACLE_PORT no configurado: {}", e))?;
     let oracle_db = env::var("ORACLE_DB").map_err(|e| format!("ORACLE_DB no configurado: {}", e))?;
-    
+
     let connect_string = format!("//{}:{}{}", oracle_ip, oracle_port, oracle_db);
-    
+
     let conn = Connection::connect(&username, &password, &connect_string)
         .map_err(|e| format!("Error conectando a Oracle: {}", e))?;
 
     let sql = "SELECT 1 FROM RE.AC WHERE NACIONALIDAD = :nacionalidad AND CEDULA = :cedula";
-    
+
     let exists = conn
         .query_row_as::<i32>(sql, &[&nacionalidad, &cedula])
         .ok()
@@ -369,27 +493,27 @@ pub async fn carga_masiva(
 }
 
 async fn process_csv(
-    buffer: &[u8], 
+    buffer: &[u8],
     app_state: web::Data<AppState>
 ) -> Result<CargaMasivaResultado, String> {
     let mut reader = ReaderBuilder::new()
         .has_headers(true)
         .from_reader(Cursor::new(buffer));
-    
+
     let mut exitosos = 0;
     let mut fallidos = 0;
     let mut detalles = Vec::new();
 
     for (idx, result) in reader.records().enumerate() {
         let record = result.map_err(|e| format!("Error leyendo CSV línea {}: {}", idx + 2, e))?;
-        
+
         if record.len() < 7 {
             fallidos += 1;
             detalles.push(format!("Línea {}: Columnas insuficientes (se esperan 7)", idx + 2));
             continue;
         }
 
-        let nacionalidad = record.get(0).unwrap_or("").trim().to_string();
+        let nacionalidad = record.get(0).unwrap_or("").trim().to_uppercase();
         let cedula: i32 = record.get(1).unwrap_or("0").trim().parse().unwrap_or(0);
         let nombre = record.get(2).unwrap_or("").trim().to_string();
         let apellido = record.get(3).unwrap_or("").trim().to_string();
@@ -397,7 +521,6 @@ async fn process_csv(
         let activo: i32 = record.get(5).unwrap_or("1").trim().parse().unwrap_or(1);
         let expired: i32 = record.get(6).unwrap_or("0").trim().parse().unwrap_or(0);
 
-        // ✅ Validar contra AC
         match validar_contra_ac(&nacionalidad, cedula).await {
             Ok(exists) => {
                 if !exists {
@@ -411,24 +534,40 @@ async fn process_csv(
             }
             Err(e) => {
                 fallidos += 1;
-                detalles.push(format!(
-                    "Línea {}: Error validando en AC: {}",
-                    idx + 2, e
-                ));
+                detalles.push(format!("Línea {}: Error validando en AC: {}", idx + 2, e));
                 continue;
             }
         }
 
-        // ✅ Crear usuario
+        // ✅ Bloquear duplicado por cédula
+        match existe_usuario_por_cedula(&app_state, &nacionalidad, cedula).await {
+            Ok(true) => {
+                fallidos += 1;
+                detalles.push(format!(
+                    "Línea {}: Ya existe un usuario con cédula {}-{} (duplicado)",
+                    idx + 2, nacionalidad, cedula
+                ));
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                fallidos += 1;
+                detalles.push(format!("Línea {}: Error verificando duplicado: {}", idx + 2, e));
+                continue;
+            }
+        }
+
         let login = generar_login(&nombre, &apellido, cedula);
         let password = generar_password(&nombre, &apellido, cedula);
         let hashed_password = format!("{:x}", Sha256::digest(password.as_bytes()));
-        
+
         let tx_result = sqlx::query(
-            "INSERT INTO usuario (nacionalidad, cedula, nombre, apellido, login, password, activo, expired) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (login) DO NOTHING
-             RETURNING id"
+            r#"
+            INSERT INTO usuario (nacionalidad, cedula, nombre, apellido, login, password, activo, expired) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (login) DO NOTHING
+            RETURNING id
+            "#
         )
         .bind(&nacionalidad)
         .bind(cedula)
@@ -443,7 +582,6 @@ async fn process_csv(
 
         match tx_result {
             Ok(Some(_)) => {
-                // ✅ Obtener ID del usuario creado
                 if let Ok(user_id) = sqlx::query_scalar::<_, i32>(
                     "SELECT id FROM usuario WHERE login = $1"
                 )
@@ -451,16 +589,17 @@ async fn process_csv(
                 .fetch_one(&app_state.pool_pg)
                 .await
                 {
-                    // ✅ Insertar en rol_usuario
                     let _ = sqlx::query(
-                        "INSERT INTO rol_usuario (id_rol, id_usuario) VALUES ($1, $2)
-                         ON CONFLICT (id_usuario) DO UPDATE SET id_rol = $1"
+                        r#"
+                        INSERT INTO rol_usuario (id_rol, id_usuario) VALUES ($1, $2)
+                        ON CONFLICT (id_usuario) DO UPDATE SET id_rol = $1
+                        "#
                     )
                     .bind(id_rol)
                     .bind(user_id)
                     .execute(&app_state.pool_pg)
                     .await;
-                    
+
                     exitosos += 1;
                     detalles.push(format!(
                         "Línea {}: Usuario {} creado exitosamente (login: {})",
@@ -468,38 +607,25 @@ async fn process_csv(
                     ));
                 } else {
                     fallidos += 1;
-                    detalles.push(format!(
-                        "Línea {}: No se pudo obtener ID del usuario {}", 
-                        idx + 2, nombre
-                    ));
+                    detalles.push(format!("Línea {}: No se pudo obtener ID del usuario {}", idx + 2, nombre));
                 }
             }
             Ok(None) => {
                 fallidos += 1;
-                detalles.push(format!(
-                    "Línea {}: Login '{}' ya existe (usuario duplicado)",
-                    idx + 2, login
-                ));
+                detalles.push(format!("Línea {}: Login '{}' ya existe (usuario duplicado)", idx + 2, login));
             }
             Err(e) => {
                 fallidos += 1;
-                detalles.push(format!(
-                    "Línea {}: Error creando usuario {}: {}",
-                    idx + 2, nombre, e
-                ));
+                detalles.push(format!("Línea {}: Error creando usuario {}: {}", idx + 2, nombre, e));
             }
         }
     }
 
-    Ok(CargaMasivaResultado {
-        exitosos,
-        fallidos,
-        detalles,
-    })
+    Ok(CargaMasivaResultado { exitosos, fallidos, detalles })
 }
 
 async fn process_excel_xlsx(
-    buffer: &[u8], 
+    buffer: &[u8],
     app_state: web::Data<AppState>
 ) -> Result<CargaMasivaResultado, String> {
     let cursor = Cursor::new(buffer.to_vec());
@@ -511,7 +637,6 @@ async fn process_excel_xlsx(
         return Err("No se encontraron hojas en el archivo XLSX".to_string());
     }
 
-    // ✅ CORREGIDO: worksheet_range devuelve Result<Range, _>, NO Option<Range>
     let range = workbook
         .worksheet_range(&sheet_names[0])
         .map_err(|e| format!("Error al leer hoja XLSX: {}", e))?;
@@ -520,7 +645,7 @@ async fn process_excel_xlsx(
 }
 
 async fn process_excel_xls(
-    buffer: &[u8], 
+    buffer: &[u8],
     app_state: web::Data<AppState>
 ) -> Result<CargaMasivaResultado, String> {
     let cursor = Cursor::new(buffer.to_vec());
@@ -532,7 +657,6 @@ async fn process_excel_xls(
         return Err("No se encontraron hojas en el archivo XLS".to_string());
     }
 
-    // ✅ CORREGIDO: worksheet_range devuelve Result<Range, _>, NO Option<Range>
     let range = workbook
         .worksheet_range(&sheet_names[0])
         .map_err(|e| format!("Error al leer hoja XLS: {}", e))?;
@@ -549,11 +673,10 @@ async fn process_excel_range(
     let mut detalles = Vec::new();
     let mut row_idx = 0;
 
-    // ✅ CORREGIDO: Iterar directamente sobre las filas del rango
     for row in range.rows() {
         if row_idx == 0 {
             row_idx += 1;
-            continue; // Saltar headers
+            continue;
         }
 
         if row.len() < 7 {
@@ -563,97 +686,97 @@ async fn process_excel_range(
             continue;
         }
 
-        // ✅ Calamine 0.23: Float es &f64, String es &str
         let nacionalidad = match &row[0] {
-            CalamineDataType::String(s) => s.trim().to_string(),
-            CalamineDataType::Empty => "".to_string(),
+            CalamineDataType::String(s) => s.trim().to_uppercase(),
             _ => "".to_string(),
         };
 
         let cedula = match &row[1] {
-            CalamineDataType::Float(f) => *f as i32,  // ✅ *f porque es &f64
+            CalamineDataType::Float(f) => *f as i32,
             CalamineDataType::String(s) => s.trim().parse().unwrap_or(0),
-            CalamineDataType::Empty => 0,
             _ => 0,
         };
 
         let nombre = match &row[2] {
             CalamineDataType::String(s) => s.trim().to_string(),
-            CalamineDataType::Empty => "".to_string(),
             _ => "".to_string(),
         };
 
         let apellido = match &row[3] {
             CalamineDataType::String(s) => s.trim().to_string(),
-            CalamineDataType::Empty => "".to_string(),
             _ => "".to_string(),
         };
 
         let id_rol = match &row[4] {
             CalamineDataType::Float(f) => *f as i32,
             CalamineDataType::String(s) => s.trim().parse().unwrap_or(0),
-            CalamineDataType::Empty => 0,
             _ => 0,
         };
 
         let activo = match &row[5] {
             CalamineDataType::Float(f) => *f as i32,
             CalamineDataType::String(s) => s.trim().parse().unwrap_or(1),
-            CalamineDataType::Empty => 1,
             _ => 1,
         };
 
         let expired = match &row[6] {
             CalamineDataType::Float(f) => *f as i32,
             CalamineDataType::String(s) => s.trim().parse().unwrap_or(0),
-            CalamineDataType::Empty => 0,
             _ => 0,
         };
 
         if nacionalidad.is_empty() || cedula == 0 || nombre.is_empty() || id_rol == 0 {
             fallidos += 1;
-            detalles.push(format!(
-                "Fila {}: Datos incompletos (nacionalidad, cédula, nombre o rol requeridos)",
-                row_idx + 1
-            ));
+            detalles.push(format!("Fila {}: Datos incompletos", row_idx + 1));
             row_idx += 1;
             continue;
         }
 
-        // ✅ Validar contra AC
         match validar_contra_ac(&nacionalidad, cedula).await {
             Ok(exists) => {
                 if !exists {
                     fallidos += 1;
-                    detalles.push(format!(
-                        "Fila {}: Cédula {}-{} no existe en registro electoral",
-                        row_idx + 1, nacionalidad, cedula
-                    ));
+                    detalles.push(format!("Fila {}: Cédula {}-{} no existe en AC", row_idx + 1, nacionalidad, cedula));
                     row_idx += 1;
                     continue;
                 }
             }
             Err(e) => {
                 fallidos += 1;
-                detalles.push(format!(
-                    "Fila {}: Error validando en AC: {}",
-                    row_idx + 1, e
-                ));
+                detalles.push(format!("Fila {}: Error validando en AC: {}", row_idx + 1, e));
                 row_idx += 1;
                 continue;
             }
         }
 
-        // ✅ Crear usuario
+        // ✅ Bloquear duplicado por cédula
+        match existe_usuario_por_cedula(&app_state, &nacionalidad, cedula).await {
+            Ok(true) => {
+                fallidos += 1;
+                detalles.push(format!("Fila {}: Ya existe un usuario con {}-{} (duplicado)", row_idx + 1, nacionalidad, cedula));
+                row_idx += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                fallidos += 1;
+                detalles.push(format!("Fila {}: Error verificando duplicado: {}", row_idx + 1, e));
+                row_idx += 1;
+                continue;
+            }
+        }
+
         let login = generar_login(&nombre, &apellido, cedula);
         let password = generar_password(&nombre, &apellido, cedula);
         let hashed_password = format!("{:x}", Sha256::digest(password.as_bytes()));
-        
+
         let tx_result = sqlx::query(
-            "INSERT INTO usuario (nacionalidad, cedula, nombre, apellido, login, password, activo, expired) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (login) DO NOTHING
-             RETURNING id"
+            r#"
+            INSERT INTO usuario (nacionalidad, cedula, nombre, apellido, login, password, activo, expired) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (login) DO NOTHING
+            RETURNING id
+            "#
         )
         .bind(&nacionalidad)
         .bind(cedula)
@@ -676,49 +799,35 @@ async fn process_excel_range(
                 .await
                 {
                     let _ = sqlx::query(
-                        "INSERT INTO rol_usuario (id_rol, id_usuario) VALUES ($1, $2)
-                         ON CONFLICT (id_usuario) DO UPDATE SET id_rol = $1"
+                        r#"
+                        INSERT INTO rol_usuario (id_rol, id_usuario) VALUES ($1, $2)
+                        ON CONFLICT (id_usuario) DO UPDATE SET id_rol = $1
+                        "#
                     )
                     .bind(id_rol)
                     .bind(user_id)
                     .execute(&app_state.pool_pg)
                     .await;
-                    
+
                     exitosos += 1;
-                    detalles.push(format!(
-                        "Fila {}: Usuario {} creado exitosamente (login: {})",
-                        row_idx + 1, nombre, login
-                    ));
+                    detalles.push(format!("Fila {}: Usuario {} creado exitosamente (login: {})", row_idx + 1, nombre, login));
                 } else {
                     fallidos += 1;
-                    detalles.push(format!(
-                        "Fila {}: No se pudo obtener ID del usuario {}",
-                        row_idx + 1, nombre
-                    ));
+                    detalles.push(format!("Fila {}: No se pudo obtener ID del usuario {}", row_idx + 1, nombre));
                 }
             }
             Ok(None) => {
                 fallidos += 1;
-                detalles.push(format!(
-                    "Fila {}: Login '{}' ya existe (usuario duplicado)",
-                    row_idx + 1, login
-                ));
+                detalles.push(format!("Fila {}: Login '{}' ya existe (usuario duplicado)", row_idx + 1, login));
             }
             Err(e) => {
                 fallidos += 1;
-                detalles.push(format!(
-                    "Fila {}: Error creando usuario {}: {}",
-                    row_idx + 1, nombre, e
-                ));
+                detalles.push(format!("Fila {}: Error creando usuario {}: {}", row_idx + 1, nombre, e));
             }
         }
 
         row_idx += 1;
     }
 
-    Ok(CargaMasivaResultado {
-        exitosos,
-        fallidos,
-        detalles,
-    })
+    Ok(CargaMasivaResultado { exitosos, fallidos, detalles })
 }

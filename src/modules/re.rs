@@ -1,3 +1,4 @@
+// re.rs
 use actix_web::{web, HttpResponse, Error};
 use oracle::{Connection, Row, RowValue};
 use serde::Deserialize;
@@ -130,7 +131,6 @@ fn yyyymmdd_to_iso(s: &str) -> Option<String> {
     Some(format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8]))
 }
 
-
 // ✅ helper: siempre 9 dígitos
 fn pad9(n: i64) -> String {
     format!("{:09}", n)
@@ -182,7 +182,6 @@ fn build_direccion_elector(
         na(apartamento),
     )
 }
-
 
 // ✅ Formato final: "13 - MIRANDA" / "08 - PLAZA" / "01 - GUARENAS"
 fn fmt_geo(code: i64, desc: Option<String>) -> String {
@@ -303,21 +302,21 @@ pub async fn get_elector(
     resp.descripcion_objecion = row.get(6).ok();
 
     // ✅ NUEVO: dirección elector (MAESTRO_DIRECCION)
-let ciudad: Option<String> = row.get(7).ok();
-let urbanizacion: Option<String> = row.get(8).ok();
-let sector: Option<String> = row.get(9).ok();
-let avenida_calle: Option<String> = row.get(10).ok();
-let edificio_casa: Option<String> = row.get(11).ok();
-let apartamento: Option<String> = row.get(12).ok();
+    let ciudad: Option<String> = row.get(7).ok();
+    let urbanizacion: Option<String> = row.get(8).ok();
+    let sector: Option<String> = row.get(9).ok();
+    let avenida_calle: Option<String> = row.get(10).ok();
+    let edificio_casa: Option<String> = row.get(11).ok();
+    let apartamento: Option<String> = row.get(12).ok();
 
-resp.direccion_elector = Some(build_direccion_elector(
-    ciudad,
-    urbanizacion,
-    sector,
-    avenida_calle,
-    edificio_casa,
-    apartamento,
-));
+    resp.direccion_elector = Some(build_direccion_elector(
+        ciudad,
+        urbanizacion,
+        sector,
+        avenida_calle,
+        edificio_casa,
+        apartamento,
+    ));
 
     // ---------------------
     // 2) instrumentos.cuaderno_actual2
@@ -506,7 +505,6 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
         return None;
     }
 
-    // evita temporales (E0716): guardamos el String
     let binding = s
         .replace("--", "-")
         .replace("- -", "-")
@@ -514,7 +512,6 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
         .replace("/", "-");
     let clean = binding.trim();
 
-    // Caso 1: YYYY-MM-DD (aunque venga sin ceros: 1960-7-1)
     if clean.contains('-') {
         let parts: Vec<&str> = clean.split('-').filter(|p| !p.is_empty()).collect();
         if parts.len() >= 3 {
@@ -532,7 +529,6 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
         }
     }
 
-    // Caso 2: YYYYMMDD -> YYYY-MM-DD
     if clean.len() == 8 && clean.chars().all(|c| c.is_ascii_digit()) {
         let y = &clean[0..4];
         let m = &clean[4..6];
@@ -545,7 +541,6 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
         }
     }
 
-    // Caso 3: extraer 8 dígitos seguidos
     let digits: String = clean.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() >= 8 {
         let y = &digits[0..4];
@@ -565,7 +560,6 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
 pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResponse, Error> {
     let q = query.into_inner();
 
-    // 1) Validar: al menos 1 dato
     let hay_dato =
         q.cedula.is_some()
         || q.fecha_nacimiento.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
@@ -580,18 +574,15 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         return Err(actix_web::error::ErrorBadRequest("Ingrese al menos un dato"));
     }
 
-    // 2) Conexión Oracle
     let conn = oracle_conn().map_err(|e| {
         actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e))
     })?;
 
-    // 3) FROM + WHERE reutilizable
     let mut from_where = String::from(r#"
         FROM V_RE_ACTUAL_CVA
         WHERE 1=1
     "#);
 
-    // 4) binds
     let mut binds_str: Vec<(String, String)> = vec![];
     let mut binds_i64: Vec<(String, i64)> = vec![];
 
@@ -599,7 +590,6 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         s.trim().to_uppercase()
     }
 
-    // 5) filtros
     if let Some(nac) = q.nacionalidad.as_ref().map(|x| x.trim().to_uppercase()) {
         if nac == "V" || nac == "E" {
             from_where.push_str(" AND NACIONALIDAD = :nacionalidad ");
@@ -615,7 +605,6 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         binds_i64.push(("cedula".into(), ced));
     }
 
-    // ✅ FECHA en BD: VARCHAR2(10) 'YYYY-MM-DD' -> se compara directo
     if let Some(fnac_input) = q.fecha_nacimiento.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         let iso = normalize_date(Some(fnac_input))
             .ok_or_else(|| actix_web::error::ErrorBadRequest("fecha_nacimiento inválida (YYYY-MM-DD)"))?;
@@ -649,7 +638,6 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         binds_str.push(("codigo_centro".into(), s.to_string()));
     }
 
-    // 6) params
     let mut params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
     for (k, v) in &binds_str {
         params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
@@ -658,7 +646,6 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
     }
 
-    // 7) SELECT
     let sql_select = format!(
         r#"
         SELECT 
@@ -698,7 +685,6 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         let fecha_raw: Option<String> = row.get(6).ok();
         let fecha_iso = normalize_date(fecha_raw.as_deref());
 
-        // si CODIGO_CENTRO_VOTACION ya es VARCHAR2(9), puedes leerlo como String
         let codigo_centro: Option<String> = row.get(7).ok();
 
         items.push(ElectorListaItem {
@@ -714,4 +700,196 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
     }
 
     Ok(HttpResponse::Ok().json(items))
+}
+
+// ======================================================================
+// NUEVO: Votos a emitir (Subsección 2 solicitada)
+// GET /api/get-votos-emitir/{nacionalidad}/{cedula}
+// ======================================================================
+
+#[derive(serde::Serialize, Default)]
+pub struct VotosEmitirResponse {
+    pub circ_consejo_nom: i32,
+    pub circ_asamblea_leg: i32,
+    pub alcalde_distrital: i32,
+    pub alcalde_metropolitano: i32,
+    pub alcalde_municipal: i32,
+    pub concejal_cabildo_dist_lista: i32,
+    pub concejal_cabildo_dist_nom: i32,
+    pub concejal_municipal_lista: i32,
+    pub concejal_municipal_nom: i32,
+    pub diputado_nom_asamb_nac: i32,
+    pub diputado_ind_asamb_nac: i32,
+    pub diputado_lista_asamb_nac: i32,
+    pub diputados_consejo_leg_list: i32,
+    pub diputados_consejo_leg_nom: i32,
+    pub diputados_parlamento_andino: i32,
+    pub diputados_parlam_lat_ame: i32,
+    pub gobernador: i32,
+    pub presidente: i32,
+    pub referendos: i32,
+    pub concejal_cabildo_metrop_nom: i32,
+    pub concejal_cabildo_metrop_list: i32,
+    pub repres_ind_cabildo_dist: i32,
+    pub repres_ind_concejal_mun: i32,
+    pub representante_consejo_leg: i32,
+    pub junta_parroquial_nominal: i32,
+    pub junta_parroquial_lista: i32,
+}
+
+fn parse_i32_opt(s: Option<String>) -> i32 {
+    let t = s.unwrap_or_default().trim().to_string();
+    if t.is_empty() {
+        return 0;
+    }
+    if t.eq_ignore_ascii_case("no aplica") {
+        return 0;
+    }
+    t.parse::<i32>().unwrap_or(0)
+}
+
+pub async fn get_votos_emitir(
+    path: web::Path<(String, String)>,
+) -> Result<HttpResponse, Error> {
+    let (nacionalidad_raw, cedula_raw) = path.into_inner();
+    let nacionalidad = nacionalidad_raw.trim().to_uppercase();
+    let cedula: i64 = cedula_raw
+        .trim()
+        .parse()
+        .map_err(|_| actix_web::error::ErrorBadRequest("cedula inválida"))?;
+
+    if !(nacionalidad == "V" || nacionalidad == "E") {
+        return Err(actix_web::error::ErrorBadRequest("nac debe ser V o E"));
+    }
+    if cedula <= 0 || cedula > 99_999_999 {
+        return Err(actix_web::error::ErrorBadRequest("cedula inválida"));
+    }
+
+    let conn = oracle_conn()
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e)))?;
+
+    // 1) Geo (como Java): AC + CENTRO_VOTACION + conversion_centro_votacion
+    let sql_geo = r#"
+        SELECT a.centro_votacion, ccv.codigo_nuevo, cv.estado, cv.distrito, cv.municipio
+        FROM AC a, CENTRO_VOTACION cv, conversion_centro_votacion ccv
+        WHERE a.NACIONALIDAD = :nac
+          AND a.CEDULA = :ced
+          AND a.centro_votacion = cv.codigo
+          AND a.centro_votacion = ccv.codigo_actual
+    "#;
+
+    let mut rows_geo = conn.query(sql_geo, &[&nacionalidad, &cedula])
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error geo query: {}", e)))?;
+
+    let row_geo_opt = rows_geo.next().transpose()
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error leyendo geo: {}", e)))?;
+
+    let row_geo = match row_geo_opt {
+        Some(r) => r,
+        None => return Ok(HttpResponse::Ok().json(VotosEmitirResponse::default())),
+    };
+
+    // ✅ FIX IMPORTANTE: Row::get necesita 2 genéricos (I, T)
+    let cod_estado: i64 =
+        parse_i32_opt(row_geo.get::<usize, Option<String>>(2).ok().flatten()) as i64;
+    let cod_municipio: i64 =
+        parse_i32_opt(row_geo.get::<usize, Option<String>>(3).ok().flatten()) as i64;
+    let cod_parroq: i64 =
+        parse_i32_opt(row_geo.get::<usize, Option<String>>(4).ok().flatten()) as i64;
+
+    if cod_estado == 0 || cod_municipio == 0 || cod_parroq == 0 {
+        return Ok(HttpResponse::Ok().json(VotosEmitirResponse::default()));
+    }
+
+    // 2) Votos_Emitir (como Java)
+    let sql_votos = r#"
+        SELECT
+            CIRC_CONCEJ,
+            CIRC_ASAMB_LEG,
+            PRESIDENTE,
+            DIP_NOM_ASAMB_NAC,
+            DIP_LIS_ASAMB_NAC,
+            DIP_IND_SAMB_NAC,
+            DIP_PARLAM_ANDINO,
+            DIP_PARLAM_LAT_AMER,
+            GOBERNADOR,
+            DIP_CONC_LEG_NOM,
+            DIP_CONC_LEG_LIS,
+            REP_IND_CONC_LEG,
+            ALCALD_METROPOL,
+            CONC_CAB_METROP_NOM,
+            CONC_CAB_METROP_LIS,
+            ALCALDE_DISTRITAL,
+            CONC_CAB_DIST_NOM,
+            CONC_CAB_DIST_LIS,
+            REP_IND_CAB_DIST,
+            ALCALDE_MUNICIPAL,
+            CONC_MUNIC_NOM,
+            CONC_MUNIC_LIS,
+            REP_IND_CONC_MUNIC,
+            JUNTA_PARRQ_NOM,
+            JUNTA_PARRQ_LIS,
+            REFERENDOS
+        FROM MC.VOTOS_EMITIR
+        WHERE cod_estado = :cod_estado
+          AND cod_municipio = :cod_municipio
+          AND cod_parroq = :cod_parroq
+    "#;
+
+    let mut rows_v = conn.query(sql_votos, &[&cod_estado, &cod_municipio, &cod_parroq])
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error votos query: {}", e)))?;
+
+    let row_v_opt = rows_v.next().transpose()
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Error leyendo votos: {}", e)))?;
+
+    let r = match row_v_opt {
+        Some(x) => x,
+        None => return Ok(HttpResponse::Ok().json(VotosEmitirResponse::default())),
+    };
+
+    // ✅ FIX: Row::get con 2 genéricos
+    let get_s = |idx: usize| -> i32 {
+        parse_i32_opt(r.get::<usize, Option<String>>(idx).ok().flatten())
+    };
+
+    let resp = VotosEmitirResponse {
+        circ_consejo_nom: get_s(0),
+        circ_asamblea_leg: get_s(1),
+
+        presidente: get_s(2),
+
+        diputado_nom_asamb_nac: get_s(3),
+        diputado_lista_asamb_nac: get_s(4),
+        diputado_ind_asamb_nac: get_s(5),
+
+        diputados_parlamento_andino: get_s(6),
+        diputados_parlam_lat_ame: get_s(7),
+
+        gobernador: get_s(8),
+
+        diputados_consejo_leg_nom: get_s(9),
+        diputados_consejo_leg_list: get_s(10),
+        representante_consejo_leg: get_s(11),
+
+        alcalde_metropolitano: get_s(12),
+        concejal_cabildo_metrop_nom: get_s(13),
+        concejal_cabildo_metrop_list: get_s(14),
+
+        alcalde_distrital: get_s(15),
+        concejal_cabildo_dist_nom: get_s(16),
+        concejal_cabildo_dist_lista: get_s(17),
+        repres_ind_cabildo_dist: get_s(18),
+
+        alcalde_municipal: get_s(19),
+        concejal_municipal_nom: get_s(20),
+        concejal_municipal_lista: get_s(21),
+        repres_ind_concejal_mun: get_s(22),
+
+        junta_parroquial_nominal: get_s(23),
+        junta_parroquial_lista: get_s(24),
+
+        referendos: get_s(25),
+    };
+
+    Ok(HttpResponse::Ok().json(resp))
 }
