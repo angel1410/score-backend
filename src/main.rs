@@ -41,7 +41,8 @@ mod modules {
     pub use users::{
         get_usuarios, crear_usuario, actualizar_usuario, bloquear_usuario,
         eliminar_usuario,
-        carga_masiva, get_roles
+        carga_masiva, get_roles,
+        descargar_plantilla,
     };
     pub use ac::get_usuario_by_ac;
 }
@@ -112,6 +113,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/usuarios/{id}", web::delete().to(modules::eliminar_usuario))
                     .route("/usuarios/{id}/bloquear", web::put().to(modules::bloquear_usuario))
                     .route("/usuarios/carga-masiva", web::post().to(modules::carga_masiva))
+                    .route("/usuarios/plantilla", web::get().to(modules::descargar_plantilla))
                     .route("/get_usuario_by_ac/{nacionalidad}/{cedula}", web::get().to(modules::get_usuario_by_ac))
                     .route("/roles", web::get().to(modules::get_roles)),
             )

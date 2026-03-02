@@ -1,9 +1,11 @@
 // users.rs
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{web, HttpResponse, Responder, Error};
 use actix_multipart::Multipart;
 use sqlx::FromRow;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
+use std::path::PathBuf;
+use log::info;
 use csv::ReaderBuilder;
 use calamine::{DataType as CalamineDataType, Reader, Xls, Xlsx};
 use futures_util::TryStreamExt;
@@ -55,6 +57,12 @@ pub struct CargaMasivaResultado {
     pub exitosos: usize,
     pub fallidos: usize,
     pub detalles: Vec<String>,
+}
+
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
 }
 
 fn generar_login(nombre: &str, apellido: &str, _cedula: i32) -> String {
@@ -427,10 +435,16 @@ async fn validar_contra_ac(nacionalidad: &str, cedula: i32) -> Result<bool, Stri
     let oracle_port = env::var("ORACLE_PORT").map_err(|e| format!("ORACLE_PORT no configurado: {}", e))?;
     let oracle_db = env::var("ORACLE_DB").map_err(|e| format!("ORACLE_DB no configurado: {}", e))?;
 
-    let connect_string = format!("//{}:{}{}", oracle_ip, oracle_port, oracle_db);
+    log::info!("🔗 Oracle: {}@{}:{}/{}", username, oracle_ip, oracle_port, oracle_db);
+
+    // ✅ CORREGIDO: Agregar la / antes de oracle_db
+    let connect_string = format!("//{}:{}/{}", oracle_ip, oracle_port, oracle_db);
 
     let conn = Connection::connect(&username, &password, &connect_string)
-        .map_err(|e| format!("Error conectando a Oracle: {}", e))?;
+        .map_err(|e| {
+            log::error!("❌ Error Oracle: {}", e);
+            format!("Error conectando a Oracle: {}", e)
+        })?;
 
     let sql = "SELECT 1 FROM RE.AC WHERE NACIONALIDAD = :nacionalidad AND CEDULA = :cedula";
 
@@ -679,13 +693,15 @@ async fn process_excel_range(
             continue;
         }
 
-        if row.len() < 7 {
+        // ✅ Validar 6 columnas
+        if row.len() < 6 {
             fallidos += 1;
-            detalles.push(format!("Fila {}: Columnas insuficientes", row_idx + 1));
+            detalles.push(format!("Fila {}: Columnas insuficientes (se esperan 6)", row_idx + 1));
             row_idx += 1;
             continue;
         }
 
+        // ✅ Leer 6 columnas (completar los match)
         let nacionalidad = match &row[0] {
             CalamineDataType::String(s) => s.trim().to_uppercase(),
             _ => "".to_string(),
@@ -697,41 +713,52 @@ async fn process_excel_range(
             _ => 0,
         };
 
-        let nombre = match &row[2] {
+        let primer_nombre = match &row[2] {
             CalamineDataType::String(s) => s.trim().to_string(),
             _ => "".to_string(),
         };
 
-        let apellido = match &row[3] {
+        let segundo_nombre = match &row[3] {
             CalamineDataType::String(s) => s.trim().to_string(),
             _ => "".to_string(),
         };
 
-        let id_rol = match &row[4] {
-            CalamineDataType::Float(f) => *f as i32,
-            CalamineDataType::String(s) => s.trim().parse().unwrap_or(0),
-            _ => 0,
+        let primer_apellido = match &row[4] {
+            CalamineDataType::String(s) => s.trim().to_string(),
+            _ => "".to_string(),
         };
 
-        let activo = match &row[5] {
-            CalamineDataType::Float(f) => *f as i32,
-            CalamineDataType::String(s) => s.trim().parse().unwrap_or(1),
-            _ => 1,
+        let segundo_apellido = match &row[5] {
+            CalamineDataType::String(s) => s.trim().to_string(),
+            _ => "".to_string(),
         };
 
-        let expired = match &row[6] {
-            CalamineDataType::Float(f) => *f as i32,
-            CalamineDataType::String(s) => s.trim().parse().unwrap_or(0),
-            _ => 0,
-        };
+        // ✅ Generar nombre y apellido completos
+        let nombre = format!("{} {}", primer_nombre, segundo_nombre).trim().to_string();
+        let apellido = format!("{} {}", primer_apellido, segundo_apellido).trim().to_string();
 
-        if nacionalidad.is_empty() || cedula == 0 || nombre.is_empty() || id_rol == 0 {
+        // ✅ Backend genera automáticamente
+        let id_rol = 2;  // Usuario por defecto
+        let activo = 1;
+        let expired = 0;
+
+        // ✅ Validar datos requeridos
+        if nacionalidad.is_empty() || cedula == 0 || nombre.is_empty() || apellido.is_empty() {
             fallidos += 1;
             detalles.push(format!("Fila {}: Datos incompletos", row_idx + 1));
             row_idx += 1;
             continue;
         }
 
+        // ✅ Validar nacionalidad
+        if !(nacionalidad == "V" || nacionalidad == "E") {
+            fallidos += 1;
+            detalles.push(format!("Fila {}: Nacionalidad inválida (debe ser V o E)", row_idx + 1));
+            row_idx += 1;
+            continue;
+        }
+
+        // ✅ Validar contra Oracle (AC)
         match validar_contra_ac(&nacionalidad, cedula).await {
             Ok(exists) => {
                 if !exists {
@@ -766,10 +793,12 @@ async fn process_excel_range(
             }
         }
 
+        // ✅ Generar login y password
         let login = generar_login(&nombre, &apellido, cedula);
         let password = generar_password(&nombre, &apellido, cedula);
         let hashed_password = format!("{:x}", Sha256::digest(password.as_bytes()));
 
+        // ✅ Insertar usuario
         let tx_result = sqlx::query(
             r#"
             INSERT INTO usuario (nacionalidad, cedula, nombre, apellido, login, password, activo, expired) 
@@ -831,3 +860,29 @@ async fn process_excel_range(
 
     Ok(CargaMasivaResultado { exitosos, fallidos, detalles })
 }
+
+
+    // ✅ Función descargar_plantilla():
+    pub async fn descargar_plantilla() -> Result<HttpResponse, Error> {
+        info!("📥 Sirviendo plantilla Excel");
+
+        let file_path = PathBuf::from("files/templates/plantilla.xlsx");
+        
+        if !file_path.exists() {
+            return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Plantilla no encontrada en el servidor".to_string(),
+            }));
+        }
+
+        let file_bytes = std::fs::read(&file_path).map_err(|e| {
+            actix_web::error::ErrorInternalServerError(e)
+        })?;
+
+        info!("✅ Plantilla enviada: {} bytes", file_bytes.len());
+
+        Ok(HttpResponse::Ok()
+            .content_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            .insert_header(("Content-Disposition", "attachment; filename=\"plantilla_usuarios.xlsx\""))
+            .body(file_bytes))
+    }
+
