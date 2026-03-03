@@ -1,5 +1,6 @@
 // src/modules/login.rs
 use crate::structs;
+use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};  // ✅ AGREGAR
 use actix_web::{web, HttpResponse};
 use chrono::{Duration, Utc, Local};
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -30,8 +31,8 @@ pub struct CaptchaResponse {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DatosLogin {
     id: i32,
-    id_rol: i32,              // ✅ ID del rol
-    nombre_rol: String,       // ✅ NUEVO: Nombre del rol
+    id_rol: i32,
+    nombre_rol: String,
     nacionalidad: String,
     cedula: i32,
     primer_nombre: String,
@@ -229,18 +230,18 @@ pub async fn get_login(
     // ✅ 6. Mapear row a struct (12 columnas, índices 0-11)
     let login_data = match row_query {
         Some(row) => DatosLogin {
-            id: row.get(0),               // id
-            id_rol: row.get(1),           // id_rol
-            nombre_rol: row.get(2),       // ✅ nombre_rol (del JOIN)
-            nacionalidad: row.get(3),     // nacionalidad
-            cedula: row.get(4),           // cedula
-            primer_nombre: row.get(5),    // primer_nombre
-            segundo_nombre: row.get(6),   // segundo_nombre
-            primer_apellido: row.get(7),  // primer_apellido
-            segundo_apellido: row.get(8), // segundo_apellido
-            username: row.get(9),         // username
-            activo: row.get(10),          // activo (bool)
-            expira: row.get(11),          // expira (bool)
+            id: row.get(0),
+            id_rol: row.get(1),
+            nombre_rol: row.get(2),
+            nacionalidad: row.get(3),
+            cedula: row.get(4),
+            primer_nombre: row.get(5),
+            segundo_nombre: row.get(6),
+            primer_apellido: row.get(7),
+            segundo_apellido: row.get(8),
+            username: row.get(9),
+            activo: row.get(10),
+            expira: row.get(11),
         },
         None => {
             warn!("❌ Credenciales inválidas - Cédula: {}", cedula);
@@ -307,28 +308,52 @@ pub async fn get_login(
     };
 
     // ✅ 10. Log con nombre completo, rol ID y nombre del rol
-    let nombre_completo = [
-        login_data.primer_nombre.as_str(),
-        login_data.segundo_nombre.as_str()
-    ]
-    .into_iter()
-    .filter(|s| !s.is_empty())
-    .collect::<Vec<_>>()
-    .join(" ");
+let nombre_completo = [
+    login_data.primer_nombre.as_str(),
+    login_data.segundo_nombre.as_str()
+]
+.into_iter()
+.filter(|s| !s.is_empty())
+.collect::<Vec<_>>()
+.join(" ");
 
-    info!("✅ Login exitoso - Usuario: {} ({}) - Rol: {} ({})", nombre_completo, cedula, login_data.id_rol, login_data.nombre_rol);
+info!("✅ Login exitoso - Usuario: {} ({}) - Rol: {} ({})", nombre_completo, cedula, login_data.id_rol, login_data.nombre_rol);
 
-    let response = LoginResponse { 
-        token, 
-        user: login_data,
-        server_time,
-    };
+// ✅ EXTRAER VALORES PARA LOGGING ANTES DE MOVER login_data
+let usuario_id = login_data.id;
+let usuario_cedula = login_data.cedula;
 
-    // ✅ 11. Resetear intentos después de login exitoso
-    {
-        let mut attempts = state.login_attempts.lock().unwrap();
-        attempts.remove(&client_ip);
-    }
+let response = LoginResponse { 
+    token, 
+    user: login_data,  // ✅ login_data se mueve aquí
+    server_time,
+};
 
-    HttpResponse::Ok().json(response)
+// ✅ 11. Resetear intentos después de login exitoso
+{
+    let mut attempts = state.login_attempts.lock().unwrap();
+    attempts.remove(&client_ip);
+}
+
+// ✅ 12. REGISTRAR LOG DE INICIO DE SESIÓN
+let ip_origen = extract_ip(&req);  // ✅ Pasar &req en vez de req.headers()
+let user_agent = extract_user_agent(&req);  // ✅ También actualizado
+
+let log_entry = LogEntry {
+    id_tipo_accion: 1,
+    id_accion: 1,
+    id_usuario: usuario_id,
+    accion: "INICIO DE SESIÓN".to_string(),
+    cedula_relacionada: Some(usuario_cedula),
+    ip_origen,
+    user_agent,
+};
+
+// ✅ Insertar log de forma asíncrona (no bloqueante)
+let pool_clone = pool.clone();
+tokio::spawn(async move {
+    let _ = registrar_log(&pool_clone, log_entry).await;
+});
+
+HttpResponse::Ok().json(response)
 }

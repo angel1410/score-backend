@@ -34,6 +34,7 @@ mod modules {
     pub mod re;
     pub mod ac;
     pub mod users;
+    pub mod logging; 
 
     pub use login::get_login;
     pub use login::get_captcha; // ✅ Nuevo endpoint

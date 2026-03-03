@@ -3,6 +3,7 @@ pub mod login;
 pub mod re;
 pub mod ac;
 pub mod users;
+pub mod logging; 
 
 pub use login::get_login;
 pub use re::{get_movimientos_re, get_elector, get_electores, get_votos_emitir}; // ✅ NUEVO
