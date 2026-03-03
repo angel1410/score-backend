@@ -187,7 +187,7 @@ pub async fn get_roles(
     app_state: web::Data<AppState>,
 ) -> impl Responder {
     match sqlx::query_as::<_, (i32, String)>(
-        "SELECT id_rol, nombre_rol FROM roles ORDER BY id_rol ASC"
+        "SELECT id, nombre_rol FROM roles ORDER BY id ASC"
     )
     .fetch_all(&app_state.pool_pg)
     .await
