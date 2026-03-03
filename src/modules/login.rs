@@ -14,9 +14,9 @@ use rand::Rng;
 pub struct InfoLogin {
     pub cedula: i32,
     pub password: String,
-    pub honeypot: Option<String>,           // 🍯 Honeypot
-    pub captcha_id: Option<String>,         // 🧮 CAPTCHA ID
-    pub captcha_answer: Option<String>,     // 🧮 CAPTCHA Respuesta
+    pub honeypot: Option<String>,
+    pub captcha_id: Option<String>,
+    pub captcha_answer: Option<String>,
 }
 
 // ✅ Respuesta del CAPTCHA
@@ -26,16 +26,20 @@ pub struct CaptchaResponse {
     pub operation: String,
 }
 
+// ✅ Estructura actualizada CON id_rol
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DatosLogin {
     id: i32,
+    id_rol: i32,              // ✅ NUEVO: Rol del usuario
     nacionalidad: String,
     cedula: i32,
-    nombre: String,
-    apellido: String,
-    login: String,
-    activo: i32,
-    expired: i32,
+    primer_nombre: String,
+    segundo_nombre: String,
+    primer_apellido: String,
+    segundo_apellido: String,
+    username: String,
+    activo: bool,
+    expira: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,17 +76,14 @@ pub async fn get_captcha(
 ) -> HttpResponse {
     let mut rng = rand::thread_rng();
     
-    // ✅ Generar números aleatorios (1-10)
     let num1 = rng.gen_range(1..10);
     let num2 = rng.gen_range(1..10);
     let result = num1 + num2;
     
-    // ✅ Generar ID único para el CAPTCHA
     let id: String = (0..16)
         .map(|_| rng.sample(&rand::distributions::Alphanumeric) as char)
         .collect();
     
-    // ✅ Guardar respuesta en memoria (expira en 5 minutos)
     {
         let mut store = state.captcha_store.lock().unwrap();
         store.insert(id.clone(), result.to_string());
@@ -106,7 +107,7 @@ pub async fn get_login(
     let password = &info.password;
     let pool = &state.pool_pg;
 
-    // 🍯 1. HONEYPOT - Si tiene valor, es bot
+    // 🍯 1. HONEYPOT
     if let Some(honeypot_value) = &info.honeypot {
         if !honeypot_value.is_empty() {
             let client_ip = req
@@ -122,7 +123,7 @@ pub async fn get_login(
         }
     }
 
-    // 🛡️ 2. RATE LIMITING - Verificar intentos por IP
+    // 🛡️ 2. RATE LIMITING
     let client_ip = req
         .headers()
         .get("X-Forwarded-For")
@@ -142,14 +143,13 @@ pub async fn get_login(
                         error: "Demasiados intentos. Espera 15 minutos.".to_string(),
                     });
                 } else {
-                    // ✅ Resetear después de 15 minutos
                     attempts.remove(&client_ip);
                 }
             }
         }
     }
 
-    // 🧮 3. CAPTCHA MATEMÁTICO - Validar respuesta
+    // 🧮 3. CAPTCHA MATEMÁTICO
     if let Some(captcha_id) = &info.captcha_id {
         if let Some(captcha_answer) = &info.captcha_answer {
             let valid = {
@@ -164,7 +164,6 @@ pub async fn get_login(
             if !valid {
                 warn!("❌ CAPTCHA incorrecto - Cédula: {}", cedula);
                 
-                // ✅ Incrementar contador de intentos
                 {
                     let mut attempts = state.login_attempts.lock().unwrap();
                     let tracker = attempts.entry(client_ip.clone()).or_insert(structs::AttemptTracker {
@@ -180,7 +179,6 @@ pub async fn get_login(
                 });
             }
             
-            // ✅ Eliminar CAPTCHA usado (un solo uso)
             {
                 let mut store = state.captcha_store.lock().unwrap();
                 store.remove(captcha_id);
@@ -203,10 +201,10 @@ pub async fn get_login(
         format!("{:x}", hasher.finalize())
     };
 
-    // ✅ 5. Consultar usuario en BD
+    // ✅ 5. Consultar usuario en BD (11 columnas CON id_rol)
     let row_query = sqlx::query(
-        "SELECT id, nacionalidad, cedula, nombre, apellido, login, activo, expired
-         FROM usuario
+        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre, primer_apellido, segundo_apellido, username, activo, expira
+         FROM usuarios
          WHERE cedula = $1 AND password = $2;",
     )
     .bind(cedula)
@@ -224,21 +222,24 @@ pub async fn get_login(
         }
     };
 
+    // ✅ 6. Mapear row a struct (11 columnas, índices 0-10)
     let login_data = match row_query {
         Some(row) => DatosLogin {
-            id: row.get(0),
-            nacionalidad: row.get(1),
-            cedula: row.get(2),
-            nombre: row.get(3),
-            apellido: row.get(4),
-            login: row.get(5),
-            activo: row.get(6),
-            expired: row.get(7),
+            id: row.get(0),               // id
+            id_rol: row.get(1),           // ✅ id_rol
+            nacionalidad: row.get(2),     // nacionalidad
+            cedula: row.get(3),           // cedula
+            primer_nombre: row.get(4),    // primer_nombre
+            segundo_nombre: row.get(5),   // segundo_nombre
+            primer_apellido: row.get(6),  // primer_apellido
+            segundo_apellido: row.get(7), // segundo_apellido
+            username: row.get(8),         // username
+            activo: row.get(9),           // activo (bool)
+            expira: row.get(10),          // expira (bool)
         },
         None => {
             warn!("❌ Credenciales inválidas - Cédula: {}", cedula);
             
-            // ✅ Incrementar contador de intentos fallidos
             {
                 let mut attempts = state.login_attempts.lock().unwrap();
                 let tracker = attempts.entry(client_ip.clone()).or_insert(structs::AttemptTracker {
@@ -255,15 +256,15 @@ pub async fn get_login(
         }
     };
 
-    // ✅ 6. Verificar usuario activo
-    if login_data.activo != 1 {
+    // ✅ 7. Verificar usuario activo (bool)
+    if !login_data.activo {
         warn!("⚠️ Usuario inactivo - Cédula: {}", cedula);
         return HttpResponse::Forbidden().json(ErrorResponse {
             error: "Usuario inactivo. Contacte al administrador.".to_string(),
         });
     }
 
-    // ✅ 7. Generar JWT Token
+    // ✅ 8. Generar JWT Token
     let now = Utc::now();
     let expiration = match now.checked_add_signed(Duration::hours(4)) {
         Some(exp) => exp.timestamp(),
@@ -290,7 +291,7 @@ pub async fn get_login(
         }
     };
 
-    // ✅ 8. Generar información de la hora del servidor
+    // ✅ 9. Generar información de la hora del servidor
     let now_local = Local::now();
     let server_time = ServerTimeInfo {
         timestamp: now.timestamp(),
@@ -300,8 +301,17 @@ pub async fn get_login(
         timezone: now_local.format("%Z").to_string(),
     };
 
-    // ✅ LOG antes de mover login_data
-    info!("✅ Login exitoso - Usuario: {} ({})", login_data.nombre, cedula);
+    // ✅ 10. Log con nombre completo y rol
+    let nombre_completo = [
+        login_data.primer_nombre.as_str(),
+        login_data.segundo_nombre.as_str()
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ");
+
+    info!("✅ Login exitoso - Usuario: {} ({}) - Rol: {}", nombre_completo, cedula, login_data.id_rol);
 
     let response = LoginResponse { 
         token, 
@@ -309,7 +319,7 @@ pub async fn get_login(
         server_time,
     };
 
-    // ✅ Resetear intentos después de login exitoso
+    // ✅ 11. Resetear intentos después de login exitoso
     {
         let mut attempts = state.login_attempts.lock().unwrap();
         attempts.remove(&client_ip);
