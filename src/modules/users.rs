@@ -13,7 +13,7 @@ use sha2::{Sha256, Digest};
 use log;
 use crate::structs::AppState;
 
-// ✅ Estructura Usuario actualizada (tabla: usuarios)
+// ✅ Estructura Usuario para operaciones CRUD (sin nombre_rol)
 #[derive(FromRow, Serialize, Deserialize, Debug, Clone)]
 pub struct Usuario {
     pub id: i32,
@@ -29,6 +29,25 @@ pub struct Usuario {
     pub activo: bool,
     pub expira: bool,
 }
+
+// ✅ NUEVA: Estructura para respuesta con nombre_rol (solo lectura)
+// ✅ AGREGAR FromRow aquí
+#[derive(FromRow, Serialize, Deserialize, Debug, Clone)]
+pub struct UsuarioConRol {
+    pub id: i32,
+    pub id_rol: i32,
+    pub nombre_rol: String,      // ✅ Viene del JOIN con roles
+    pub nacionalidad: String,
+    pub cedula: i32,
+    pub primer_nombre: String,
+    pub segundo_nombre: String,
+    pub primer_apellido: String,
+    pub segundo_apellido: String,
+    pub username: String,
+    pub activo: bool,
+    pub expira: bool,
+}
+
 
 // ✅ Estructura para crear usuario
 #[derive(Deserialize, Serialize, Debug)]
@@ -127,26 +146,27 @@ async fn existe_usuario_por_cedula(
     Ok(exists)
 }
 
-// ✅ LISTAR todos los usuarios
+// ✅ LISTAR todos los usuarios CON nombre_rol
 pub async fn get_usuarios(
     app_state: web::Data<AppState>,
 ) -> impl Responder {
-    match sqlx::query_as::<_, Usuario>(
+    match sqlx::query_as::<_, UsuarioConRol>(
         "SELECT 
-            id,
-            id_rol,
-            nacionalidad, 
-            cedula, 
-            primer_nombre,
-            segundo_nombre,
-            primer_apellido,
-            segundo_apellido,
-            username,
-            password, 
-            activo, 
-            expira
-         FROM usuarios
-         ORDER BY id DESC"
+            u.id,
+            u.id_rol,
+            COALESCE(r.nombre_rol, 'Sin Rol') AS nombre_rol,
+            u.nacionalidad, 
+            u.cedula, 
+            u.primer_nombre,
+            u.segundo_nombre,
+            u.primer_apellido,
+            u.segundo_apellido,
+            u.username,
+            u.activo, 
+            u.expira
+         FROM usuarios u
+         LEFT JOIN roles r ON u.id_rol = r.id
+         ORDER BY u.id DESC"
     )
     .fetch_all(&app_state.pool_pg)
     .await
@@ -167,7 +187,7 @@ pub async fn get_roles(
     app_state: web::Data<AppState>,
 ) -> impl Responder {
     match sqlx::query_as::<_, (i32, String)>(
-        "SELECT id, nombre_rol FROM roles ORDER BY id ASC"
+        "SELECT id_rol, nombre_rol FROM roles ORDER BY id_rol ASC"
     )
     .fetch_all(&app_state.pool_pg)
     .await

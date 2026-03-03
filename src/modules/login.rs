@@ -26,11 +26,12 @@ pub struct CaptchaResponse {
     pub operation: String,
 }
 
-// ✅ Estructura actualizada CON id_rol
+// ✅ Estructura actualizada CON id_rol y nombre_rol
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct DatosLogin {
     id: i32,
-    id_rol: i32,              // ✅ NUEVO: Rol del usuario
+    id_rol: i32,              // ✅ ID del rol
+    nombre_rol: String,       // ✅ NUEVO: Nombre del rol
     nacionalidad: String,
     cedula: i32,
     primer_nombre: String,
@@ -201,11 +202,14 @@ pub async fn get_login(
         format!("{:x}", hasher.finalize())
     };
 
-    // ✅ 5. Consultar usuario en BD (11 columnas CON id_rol)
+    // ✅ 5. Consultar usuario en BD (12 columnas CON JOIN a rol)
     let row_query = sqlx::query(
-        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre, primer_apellido, segundo_apellido, username, activo, expira
-         FROM usuarios
-         WHERE cedula = $1 AND password = $2;",
+        "SELECT u.id, u.id_rol, r.nombre_rol, u.nacionalidad, u.cedula, 
+                u.primer_nombre, u.segundo_nombre, u.primer_apellido, u.segundo_apellido, 
+                u.username, u.activo, u.expira
+         FROM usuarios u
+         LEFT JOIN roles r ON u.id_rol = r.id
+         WHERE u.cedula = $1 AND u.password = $2;",
     )
     .bind(cedula)
     .bind(&sha256_hash)
@@ -222,20 +226,21 @@ pub async fn get_login(
         }
     };
 
-    // ✅ 6. Mapear row a struct (11 columnas, índices 0-10)
+    // ✅ 6. Mapear row a struct (12 columnas, índices 0-11)
     let login_data = match row_query {
         Some(row) => DatosLogin {
             id: row.get(0),               // id
-            id_rol: row.get(1),           // ✅ id_rol
-            nacionalidad: row.get(2),     // nacionalidad
-            cedula: row.get(3),           // cedula
-            primer_nombre: row.get(4),    // primer_nombre
-            segundo_nombre: row.get(5),   // segundo_nombre
-            primer_apellido: row.get(6),  // primer_apellido
-            segundo_apellido: row.get(7), // segundo_apellido
-            username: row.get(8),         // username
-            activo: row.get(9),           // activo (bool)
-            expira: row.get(10),          // expira (bool)
+            id_rol: row.get(1),           // id_rol
+            nombre_rol: row.get(2),       // ✅ nombre_rol (del JOIN)
+            nacionalidad: row.get(3),     // nacionalidad
+            cedula: row.get(4),           // cedula
+            primer_nombre: row.get(5),    // primer_nombre
+            segundo_nombre: row.get(6),   // segundo_nombre
+            primer_apellido: row.get(7),  // primer_apellido
+            segundo_apellido: row.get(8), // segundo_apellido
+            username: row.get(9),         // username
+            activo: row.get(10),          // activo (bool)
+            expira: row.get(11),          // expira (bool)
         },
         None => {
             warn!("❌ Credenciales inválidas - Cédula: {}", cedula);
@@ -301,7 +306,7 @@ pub async fn get_login(
         timezone: now_local.format("%Z").to_string(),
     };
 
-    // ✅ 10. Log con nombre completo y rol
+    // ✅ 10. Log con nombre completo, rol ID y nombre del rol
     let nombre_completo = [
         login_data.primer_nombre.as_str(),
         login_data.segundo_nombre.as_str()
@@ -311,7 +316,7 @@ pub async fn get_login(
     .collect::<Vec<_>>()
     .join(" ");
 
-    info!("✅ Login exitoso - Usuario: {} ({}) - Rol: {}", nombre_completo, cedula, login_data.id_rol);
+    info!("✅ Login exitoso - Usuario: {} ({}) - Rol: {} ({})", nombre_completo, cedula, login_data.id_rol, login_data.nombre_rol);
 
     let response = LoginResponse { 
         token, 
