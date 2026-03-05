@@ -1,6 +1,6 @@
 // src/modules/login.rs
 use crate::structs;
-use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};  // ✅ AGREGAR
+use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
 use actix_web::{web, HttpResponse};
 use chrono::{Duration, Utc, Local};
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -308,52 +308,123 @@ pub async fn get_login(
     };
 
     // ✅ 10. Log con nombre completo, rol ID y nombre del rol
-let nombre_completo = [
-    login_data.primer_nombre.as_str(),
-    login_data.segundo_nombre.as_str()
-]
-.into_iter()
-.filter(|s| !s.is_empty())
-.collect::<Vec<_>>()
-.join(" ");
+    let nombre_completo = [
+        login_data.primer_nombre.as_str(),
+        login_data.segundo_nombre.as_str()
+    ]
+    .into_iter()
+    .filter(|s| !s.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ");
 
-info!("✅ Login exitoso - Usuario: {} ({}) - Rol: {} ({})", nombre_completo, cedula, login_data.id_rol, login_data.nombre_rol);
+    info!("✅ Login exitoso - Usuario: {} ({}) - Rol: {} ({})", nombre_completo, cedula, login_data.id_rol, login_data.nombre_rol);
 
-// ✅ EXTRAER VALORES PARA LOGGING ANTES DE MOVER login_data
-let usuario_id = login_data.id;
-let usuario_cedula = login_data.cedula;
+    // ✅ EXTRAER VALORES PARA LOGGING ANTES DE MOVER login_data
+    let usuario_id = login_data.id;
+    let usuario_cedula = login_data.cedula;
 
-let response = LoginResponse { 
-    token, 
-    user: login_data,  // ✅ login_data se mueve aquí
-    server_time,
-};
+    let response = LoginResponse { 
+        token, 
+        user: login_data,
+        server_time,
+    };
 
-// ✅ 11. Resetear intentos después de login exitoso
-{
-    let mut attempts = state.login_attempts.lock().unwrap();
-    attempts.remove(&client_ip);
-}
+    // ✅ 11. Resetear intentos después de login exitoso
+    {
+        let mut attempts = state.login_attempts.lock().unwrap();
+        attempts.remove(&client_ip);
+    }
 
-// ✅ 12. REGISTRAR LOG DE INICIO DE SESIÓN
-let ip_origen = extract_ip(&req);  // ✅ Pasar &req en vez de req.headers()
-let user_agent = extract_user_agent(&req);  // ✅ También actualizado
+    // ✅ 12. REGISTRAR LOG DE INICIO DE SESIÓN
+    let ip_origen = extract_ip(&req);
+    let user_agent = extract_user_agent(&req);
 
-let log_entry = LogEntry {
-    id_tipo_accion: 1,
-    id_accion: 1,
-    id_usuario: usuario_id,
-    accion: "INICIO DE SESIÓN".to_string(),
-    cedula_relacionada: Some(usuario_cedula),
-    ip_origen,
-    user_agent,
-};
+    let log_entry = LogEntry {
+        id_tipo_accion: 1,
+        id_accion: 1,
+        id_usuario: Some(usuario_id),
+        accion: "INICIO DE SESIÓN".to_string(),
+        cedula_relacionada: Some(usuario_cedula),
+        ip_origen,
+        user_agent,
+    };
 
-// ✅ Insertar log de forma asíncrona (no bloqueante)
-let pool_clone = pool.clone();
-tokio::spawn(async move {
-    let _ = registrar_log(&pool_clone, log_entry).await;
-});
+    // ✅ Insertar log de forma asíncrona (no bloqueante)
+    let pool_clone = pool.clone();
+    tokio::spawn(async move {
+        let _ = registrar_log(&pool_clone, log_entry).await;
+    });
 
-HttpResponse::Ok().json(response)
-}
+    HttpResponse::Ok().json(response)
+}  // ✅ CIERRA get_login()
+
+// ✅ Endpoint de logout con logging
+pub async fn get_logout(
+    state: web::Data<structs::AppState>,
+    req: actix_web::HttpRequest,
+) -> HttpResponse {
+    use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
+    use jsonwebtoken::{decode, DecodingKey, Validation};
+
+    // ✅ Extraer token del header Authorization
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    // ✅ Decodificar token para obtener id_usuario
+    let usuario_id = if !token.is_empty() {
+        match decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
+            &Validation::default()
+        ) {
+            Ok(token_data) => token_data.claims.sub.parse::<i32>().unwrap_or(0),
+            Err(_) => 0
+        }
+    } else {
+        0
+    };
+
+    // ✅ Obtener cédula del usuario
+    let usuario_cedula = if usuario_id > 0 {
+        match sqlx::query_scalar::<_, i32>(
+            "SELECT cedula FROM usuarios WHERE id = $1"
+        )
+        .bind(usuario_id)
+        .fetch_optional(&state.pool_pg)
+        .await
+        {
+            Ok(Some(cedula)) => Some(cedula),
+            _ => None
+        }
+    } else {
+        None
+    };
+
+    // ✅ Extraer IP y User-Agent
+    let ip_origen = extract_ip(&req);
+    let user_agent = extract_user_agent(&req);
+
+    // ✅ Registrar log de cierre de sesión
+    let log_entry = LogEntry {
+        id_tipo_accion: 1,
+        id_accion: 2,
+        id_usuario: Some(usuario_id),
+        accion: "CIERRE DE SESIÓN".to_string(),
+        cedula_relacionada: usuario_cedula,
+        ip_origen,
+        user_agent,
+    };
+
+    let pool_clone = state.pool_pg.clone();
+    tokio::spawn(async move {
+        let _ = registrar_log(&pool_clone, log_entry).await;
+    });
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "message": "Sesión cerrada exitosamente"
+    }))
+}  // ✅ CIERRA get_logout()

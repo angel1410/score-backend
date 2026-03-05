@@ -18,8 +18,8 @@ mod structs {
     pub struct AppState {
         pub pool_pg: PgPool,
         pub jwt_secret: String,
-        pub login_attempts: Arc<Mutex<HashMap<String, AttemptTracker>>>, // 🛡️ Rate Limiting
-        pub captcha_store: Arc<Mutex<HashMap<String, String>>>, // 🧮 CAPTCHA Store
+        pub login_attempts: Arc<Mutex<HashMap<String, AttemptTracker>>>,
+        pub captcha_store: Arc<Mutex<HashMap<String, String>>>,
     }
 
     #[derive(Clone)]
@@ -36,12 +36,15 @@ mod modules {
     pub mod users;
     pub mod logging; 
 
-    pub use login::get_login;
-    pub use login::get_captcha; // ✅ Nuevo endpoint
+    pub use login::{get_login, get_logout, get_captcha};
     pub use re::{get_movimientos_re, get_elector, get_electores, get_votos_emitir};
     pub use users::{
-        get_usuarios, crear_usuario, actualizar_usuario, bloquear_usuario,
+        get_usuarios, 
+        crear_usuario, 
+        actualizar_usuario, 
+        bloquear_usuario,
         eliminar_usuario,
+        reactivar_usuario, 
         carga_masiva, get_roles,
         descargar_plantilla,
     };
@@ -103,7 +106,8 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::scope("/api")
                     .route("/login", web::post().to(modules::get_login))
-                    .route("/captcha", web::get().to(modules::get_captcha)) // ✅ Nuevo endpoint
+                    .route("/logout", web::post().to(modules::get_logout))  // ✅ CORREGIDO
+                    .route("/captcha", web::get().to(modules::get_captcha))
                     .route("/get-movimientos-re/{nacionalidad}/{cedula}", web::get().to(modules::get_movimientos_re))
                     .route("/get_elector", web::get().to(modules::get_elector))
                     .route("/get_electores", web::get().to(modules::get_electores))
@@ -112,6 +116,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/usuarios", web::post().to(modules::crear_usuario))
                     .route("/usuarios/{id}", web::put().to(modules::actualizar_usuario))
                     .route("/usuarios/{id}", web::delete().to(modules::eliminar_usuario))
+                    .route("/usuarios/{id}/reactivar", web::put().to(modules::reactivar_usuario))
                     .route("/usuarios/{id}/bloquear", web::put().to(modules::bloquear_usuario))
                     .route("/usuarios/carga-masiva", web::post().to(modules::carga_masiva))
                     .route("/usuarios/plantilla", web::get().to(modules::descargar_plantilla))
