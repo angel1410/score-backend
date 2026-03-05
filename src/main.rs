@@ -1,4 +1,3 @@
-// src/main.rs
 #![allow(non_snake_case)]
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer};
@@ -8,48 +7,11 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
-mod structs {
-    use sqlx::postgres::PgPool;
-    use std::sync::{Arc, Mutex};
-    use std::collections::HashMap;
-    use chrono::{DateTime, Utc};
+// ✅ Módulo structs externo
+mod structs;
 
-    #[derive(Clone)]
-    pub struct AppState {
-        pub pool_pg: PgPool,
-        pub jwt_secret: String,
-        pub login_attempts: Arc<Mutex<HashMap<String, AttemptTracker>>>,
-        pub captcha_store: Arc<Mutex<HashMap<String, String>>>,
-    }
-
-    #[derive(Clone)]
-    pub struct AttemptTracker {
-        pub count: u32,
-        pub last_attempt: DateTime<Utc>,
-    }
-}
-
-mod modules {
-    pub mod login;
-    pub mod re;
-    pub mod ac;
-    pub mod users;
-    pub mod logging; 
-
-    pub use login::{get_login, get_logout, get_captcha};
-    pub use re::{get_movimientos_re, get_elector, get_electores, get_votos_emitir};
-    pub use users::{
-        get_usuarios, 
-        crear_usuario, 
-        actualizar_usuario, 
-        bloquear_usuario,
-        eliminar_usuario,
-        reactivar_usuario, 
-        carga_masiva, get_roles,
-        descargar_plantilla,
-    };
-    pub use ac::get_usuario_by_ac;
-}
+// ✅ Módulos
+mod modules;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -106,7 +68,7 @@ async fn main() -> std::io::Result<()> {
             .service(
                 web::scope("/api")
                     .route("/login", web::post().to(modules::get_login))
-                    .route("/logout", web::post().to(modules::get_logout))  // ✅ CORREGIDO
+                    .route("/logout", web::post().to(modules::get_logout))
                     .route("/captcha", web::get().to(modules::get_captcha))
                     .route("/get-movimientos-re/{nacionalidad}/{cedula}", web::get().to(modules::get_movimientos_re))
                     .route("/get_elector", web::get().to(modules::get_elector))
@@ -121,7 +83,9 @@ async fn main() -> std::io::Result<()> {
                     .route("/usuarios/carga-masiva", web::post().to(modules::carga_masiva))
                     .route("/usuarios/plantilla", web::get().to(modules::descargar_plantilla))
                     .route("/get_usuario_by_ac/{nacionalidad}/{cedula}", web::get().to(modules::get_usuario_by_ac))
-                    .route("/roles", web::get().to(modules::get_roles)),
+                    .route("/roles", web::get().to(modules::get_roles))
+                    .route("/logs", web::get().to(modules::logs::get_logs))
+                    .route("/logs/resumen", web::get().to(modules::logs::get_logs_resumen)),
             )
     })
     .bind(("127.0.0.1", 9000))?

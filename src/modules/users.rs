@@ -164,6 +164,7 @@ fn generar_password(primer_nombre: &str, primer_apellido: &str, cedula: i32) -> 
 }
 
 // ✅ VALIDACIÓN: verificar si existe usuario por nacionalidad+cedula
+#[allow(dead_code)]
 async fn existe_usuario_por_cedula(
     app_state: &AppState,
     nacionalidad: &str,

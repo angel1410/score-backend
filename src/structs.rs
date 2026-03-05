@@ -8,18 +8,12 @@ use chrono::{DateTime, Utc};
 pub struct AppState {
     pub pool_pg: PgPool,
     pub jwt_secret: String,
-    pub login_attempts: Arc<Mutex<HashMap<String, AttemptTracker>>>, // ✅ Rate Limiting
-    pub captcha_store: Arc<Mutex<HashMap<String, String>>>, // ✅ CAPTCHA store
+    pub login_attempts: Arc<Mutex<HashMap<String, AttemptTracker>>>,
+    pub captcha_store: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Clone)]
 pub struct AttemptTracker {
     pub count: u32,
     pub last_attempt: DateTime<Utc>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct EnvConfig {
-    pub database_url: String,
-    pub jwt_secret: String,
 }
