@@ -85,7 +85,10 @@ async fn main() -> std::io::Result<()> {
                     .route("/get_usuario_by_ac/{nacionalidad}/{cedula}", web::get().to(modules::get_usuario_by_ac))
                     .route("/roles", web::get().to(modules::get_roles))
                     .route("/logs", web::get().to(modules::logs::get_logs))
-                    .route("/logs/resumen", web::get().to(modules::logs::get_logs_resumen)),
+                    .route("/logs/resumen", web::get().to(modules::logs::get_logs_resumen))
+                    .route("/get-movimientos-re/{nacionalidad}/{cedula}", web::get().to(modules::re::get_movimientos_re))
+                    .route("/get_elector", web::get().to(modules::re::get_elector))
+                    .route("/get_votos_emitir/{nacionalidad}/{cedula}", web::get().to(modules::re::get_votos_emitir)),
             )
     })
     .bind(("127.0.0.1", 9000))?
