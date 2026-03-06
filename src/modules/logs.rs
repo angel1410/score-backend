@@ -49,9 +49,17 @@ pub async fn get_logs(
     let mut query = String::from(
         r#"
         SELECT 
-            l.id, l.id_tipo_accion, l.id_accion, l.id_usuario, l.accion,
-            l.cedula_relacionada, l.ip_origen, l.user_agent, l.created_at,
-            u.username, r.nombre_rol
+            l.id,
+            l.id_tipo_accion,
+            l.id_accion,
+            l.id_usuario,
+            l.accion,
+            l.cedula_relacionada,
+            l.ip_origen,
+            l.user_agent,
+            l.created_at,
+            u.username,
+            r.nombre_rol
         FROM logs l
         LEFT JOIN usuarios u ON l.id_usuario = u.id
         LEFT JOIN roles r ON u.id_rol = r.id
@@ -62,37 +70,70 @@ pub async fn get_logs(
     if let Some(id_usuario) = filters.id_usuario {
         query.push_str(&format!(" AND l.id_usuario = {}", id_usuario));
     }
+
     if let Some(id_tipo_accion) = filters.id_tipo_accion {
         query.push_str(&format!(" AND l.id_tipo_accion = {}", id_tipo_accion));
     }
+
     if let Some(id_accion) = filters.id_accion {
         query.push_str(&format!(" AND l.id_accion = {}", id_accion));
     }
+
     if let Some(cedula_relacionada) = filters.cedula_relacionada {
         query.push_str(&format!(" AND l.cedula_relacionada = {}", cedula_relacionada));
     }
+
     if let Some(fecha_desde) = &filters.fecha_desde {
         query.push_str(&format!(" AND l.created_at >= '{}'", fecha_desde));
     }
+
     if let Some(fecha_hasta) = &filters.fecha_hasta {
         query.push_str(&format!(" AND l.created_at <= '{}'", fecha_hasta));
     }
+
+    // ✅ MEJORADO: Filtro por accion (MULTIPLE)
     if let Some(accion) = &filters.accion {
-        query.push_str(&format!(" AND l.accion ILIKE '%{}%'", accion));
+        let acciones: Vec<&str> = accion.split(',').collect();
+        log::info!("🔍 Filtro acciones: {:?}", acciones);
+        
+        if acciones.len() == 1 {
+            // Una sola acción
+            let accion_escaped = acciones[0].replace('\'', "''");
+            query.push_str(&format!(" AND l.accion = '{}'", accion_escaped));
+            log::info!("🔍 Query con una acción: {}", accion_escaped);
+        } else {
+            // Múltiples acciones
+            let acciones_str: Vec<String> = acciones
+                .iter()
+                .map(|a| {
+                    let escaped = a.replace('\'', "''");
+                    log::info!("🔍 Acción individual: {} -> {}", a, escaped);
+                    format!("'{}'", escaped)
+                })
+                .collect();
+            let in_clause = acciones_str.join(",");
+            log::info!("🔍 IN clause: {}", in_clause);
+            query.push_str(&format!(" AND l.accion IN ({})", in_clause));
+        }
     }
 
     query.push_str(&format!(" ORDER BY l.created_at DESC LIMIT {} OFFSET {}", limit, offset));
+
+    log::info!("🔍 Query completo: {}", query);
 
     match sqlx::query_as::<_, LogEntryResponse>(&query)
         .fetch_all(&app_state.pool_pg)
         .await
     {
-        Ok(logs) => HttpResponse::Ok().json(logs),
+        Ok(logs) => {
+            log::info!("✅ Logs encontrados: {}", logs.len());
+            HttpResponse::Ok().json(logs)
+        },
         Err(e) => {
-            let error_msg = e.to_string();
+            log::error!("❌ Error obteniendo logs: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": "Error obteniendo logs",
-                "details": error_msg
+                "details": e.to_string()
             }))
         }
     }
@@ -103,7 +144,10 @@ pub async fn get_logs_resumen(
 ) -> impl Responder {
     match sqlx::query_as::<_, LogResumen>(
         r#"
-        SELECT l.id_accion, a.accion, COUNT(*)::bigint as total
+        SELECT 
+            l.id_accion,
+            a.accion,
+            COUNT(*)::bigint as total
         FROM logs l
         JOIN acciones a ON l.id_accion = a.id AND l.id_tipo_accion = a.id_tipo_accion
         GROUP BY l.id_accion, a.accion
@@ -115,10 +159,10 @@ pub async fn get_logs_resumen(
     {
         Ok(resumen) => HttpResponse::Ok().json(resumen),
         Err(e) => {
-            let error_msg = e.to_string();
+            log::error!("❌ Error obteniendo resumen de logs: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": "Error obteniendo resumen",
-                "details": error_msg
+                "details": e.to_string()
             }))
         }
     }
