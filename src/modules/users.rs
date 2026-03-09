@@ -1183,12 +1183,13 @@ pub async fn confirmar_carga_masiva(
         .await;
     }
 
-    let log_entry = LogEntry {
+    // ✅ AHORA (id_accion = 7 que SÍ existe en acciones)
+      let log_entry = LogEntry {
         id_tipo_accion: 2,
-        id_accion: carga_masiva_id.unwrap_or(0),
+        id_accion: 7,  // ← 7 = "CARGA MASIVA DE USUARIOS" en tabla acciones
         id_usuario: autor_id,
         accion: "CARGA MASIVA DE USUARIOS".to_string(),
-        cedula_relacionada: None,
+        cedula_relacionada: carga_masiva_id,  // ← AQUÍ VA EL carga_masiva_id (14, 15, 16...)
         ip_origen: ip_origen.clone(),
         user_agent: user_agent.clone(),
     };
