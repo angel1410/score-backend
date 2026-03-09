@@ -55,6 +55,8 @@ async fn main() -> std::io::Result<()> {
                         actix_web::http::header::AUTHORIZATION,
                         actix_web::http::header::ACCEPT,
                         actix_web::http::header::CONTENT_TYPE,
+                        actix_web::http::header::CACHE_CONTROL,
+                        actix_web::http::header::PRAGMA,        
                     ])
                     .max_age(3600)
                     .supports_credentials(),
@@ -80,7 +82,8 @@ async fn main() -> std::io::Result<()> {
                     .route("/usuarios/{id}", web::delete().to(modules::eliminar_usuario))
                     .route("/usuarios/{id}/reactivar", web::put().to(modules::reactivar_usuario))
                     .route("/usuarios/{id}/bloquear", web::put().to(modules::bloquear_usuario))
-                    .route("/usuarios/carga-masiva", web::post().to(modules::carga_masiva))
+                    .route("/usuarios/validar-carga-masiva", web::post().to(modules::validar_carga_masiva))
+                    .route("/usuarios/confirmar-carga-masiva", web::post().to(modules::confirmar_carga_masiva))
                     .route("/usuarios/plantilla", web::get().to(modules::descargar_plantilla))
                     .route("/get_usuario_by_ac/{nacionalidad}/{cedula}", web::get().to(modules::get_usuario_by_ac))
                     .route("/roles", web::get().to(modules::get_roles))
@@ -88,7 +91,9 @@ async fn main() -> std::io::Result<()> {
                     .route("/logs/resumen", web::get().to(modules::logs::get_logs_resumen))
                     .route("/get-movimientos-re/{nacionalidad}/{cedula}", web::get().to(modules::re::get_movimientos_re))
                     .route("/get_elector", web::get().to(modules::re::get_elector))
-                    .route("/get_votos_emitir/{nacionalidad}/{cedula}", web::get().to(modules::re::get_votos_emitir)),
+                    .route("/get_votos_emitir/{nacionalidad}/{cedula}", web::get().to(modules::re::get_votos_emitir))
+                    .route("/usuarios/carga-masiva/{id}/excel", web::get().to(modules::descargar_carga_masiva_excel))
+                    .route("/logs/carga-masiva-id/{id}", web::get().to(modules::logs::get_carga_masiva_id_by_log)),
             )
     })
     .bind(("127.0.0.1", 9000))?

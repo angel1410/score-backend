@@ -167,3 +167,43 @@ pub async fn get_logs_resumen(
         }
     }
 }
+
+// ============================================
+// ✅ NUEVO: Obtener carga_masiva_id desde log_id
+// ============================================
+
+pub async fn get_carga_masiva_id_by_log(
+    app_state: web::Data<AppState>,
+    path: web::Path<i32>,
+) -> impl Responder {
+    let log_id = path.into_inner();
+    
+    log::info!("📥 Obteniendo carga_masiva_id para log_id: {}", log_id);
+    
+    match sqlx::query_scalar::<_, i32>(
+        r#"SELECT id_accion FROM logs WHERE id = $1 AND accion = 'CARGA MASIVA DE USUARIOS'"#
+    )
+    .bind(log_id)
+    .fetch_optional(&app_state.pool_pg)
+    .await
+    {
+        Ok(Some(id)) => {
+            log::info!("📊 carga_masiva_id encontrado: {}", id);
+            HttpResponse::Ok().json(serde_json::json!({ 
+                "carga_masiva_id": id 
+            }))
+        },
+        Ok(None) => {
+            log::warn!("⚠️ Log no encontrado o no es carga masiva: {}", log_id);
+            HttpResponse::NotFound().json(serde_json::json!({ 
+                "error": format!("Log {} no encontrado o no es carga masiva", log_id)
+            }))
+        }
+        Err(e) => {
+            log::error!("Error obteniendo carga_masiva_id: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({ 
+                "error": e.to_string() 
+            }))
+        }
+    }
+}

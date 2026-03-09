@@ -6,19 +6,29 @@ pub mod users;
 pub mod logging; 
 pub mod logs;
 
+// ✅ Login
 pub use login::{get_login, get_logout, get_captcha};
-pub use re::{get_movimientos_re, get_elector, get_electores, get_votos_emitir};
-pub use ac::get_usuario_by_ac;
-// ✅ ELIMINADO: pub use logs::{get_logs, get_logs_resumen}; (no se usa)
 
+// ✅ Registro Electoral (RE)
+pub use re::{get_movimientos_re, get_elector, get_electores, get_votos_emitir};
+
+// ✅ Archivo de Cedulados (AC)
+pub use ac::get_usuario_by_ac;
+
+// ✅ Logs de Auditoría
+//pub use logs::{get_logs, get_logs_resumen, get_carga_masiva_id_by_log};
+
+// ✅ Usuarios (CRUD + Carga Masiva)
 pub use users::{
-    descargar_plantilla,
     get_usuarios,
+    get_roles,
     crear_usuario,
     actualizar_usuario,
     bloquear_usuario,
     eliminar_usuario,
     reactivar_usuario,
-    carga_masiva,
-    get_roles
+    validar_carga_masiva,
+    confirmar_carga_masiva,
+    descargar_plantilla,
+    descargar_carga_masiva_excel,
 };
