@@ -5,6 +5,7 @@ pub mod ac;
 pub mod users;
 pub mod logging; 
 pub mod logs;
+pub mod parametros;
 
 // ✅ Login
 pub use login::{get_login, get_logout, get_captcha};
@@ -31,4 +32,14 @@ pub use users::{
     confirmar_carga_masiva,
     descargar_plantilla,
     descargar_carga_masiva_excel,
+};
+
+// ✅ Parámetros (CRUD)
+pub use parametros::{
+    get_parametros,
+    get_parametro_by_nombre,
+    crear_parametro,
+    actualizar_parametro,
+    eliminar_parametro,
+    get_fecha_cierre,
 };

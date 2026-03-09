@@ -93,7 +93,13 @@ async fn main() -> std::io::Result<()> {
                     .route("/get_elector", web::get().to(modules::re::get_elector))
                     .route("/get_votos_emitir/{nacionalidad}/{cedula}", web::get().to(modules::re::get_votos_emitir))
                     .route("/usuarios/carga-masiva/{id}/excel", web::get().to(modules::descargar_carga_masiva_excel))
-                    .route("/logs/carga-masiva-id/{id}", web::get().to(modules::logs::get_carga_masiva_id_by_log)),
+                    .route("/logs/carga-masiva-id/{id}", web::get().to(modules::logs::get_carga_masiva_id_by_log))
+                    .route("/parametros", web::get().to(modules::get_parametros))
+                    .route("/parametros", web::post().to(modules::crear_parametro))
+                    .route("/parametros/{nombre}", web::get().to(modules::get_parametro_by_nombre))
+                    .route("/parametros/{id}", web::put().to(modules::actualizar_parametro))
+                    .route("/parametros/{id}", web::delete().to(modules::eliminar_parametro))
+                    .route("/parametros/fecha-cierre", web::get().to(modules::get_fecha_cierre)),
             )
     })
     .bind(("127.0.0.1", 9000))?

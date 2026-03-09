@@ -2,7 +2,7 @@
 use crate::structs;
 use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
 use actix_web::{web, HttpResponse};
-use chrono::{Duration, Utc, Local};
+use chrono::{Duration, Utc, Local, NaiveDate};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -270,7 +270,30 @@ pub async fn get_login(
         });
     }
 
-    // ✅ 8. Generar JWT Token
+    // ✅ 8. ✅ NUEVO: VALIDAR FECHA DE CIERRE (si no es ADMINISTRADOR)
+    // Asumiendo que id_rol = 1 es ADMINISTRADOR
+    if login_data.id_rol != 1 {
+        let fecha_cierre: Option<NaiveDate> = sqlx::query_scalar(
+            "SELECT p_date FROM parametros WHERE nombre_parametro = 'fecha_cierre'"
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+
+        if let Some(fecha) = fecha_cierre {
+            let hoy = Local::now().naive_local().date();
+            
+            if hoy > fecha {
+                warn!("⚠️ Fecha de cierre vencida - Cédula: {}, Fecha cierre: {}, Hoy: {}", 
+                      cedula, fecha, hoy);
+                return HttpResponse::Forbidden().json(ErrorResponse {
+                    error: "Acceso denegado. La fecha límite para inicio de sesión ha vencido.".to_string(),
+                });
+            }
+        }
+    }
+
+    // ✅ 9. Generar JWT Token
     let now = Utc::now();
     let expiration = match now.checked_add_signed(Duration::hours(4)) {
         Some(exp) => exp.timestamp(),
@@ -297,7 +320,7 @@ pub async fn get_login(
         }
     };
 
-    // ✅ 9. Generar información de la hora del servidor
+    // ✅ 10. Generar información de la hora del servidor
     let now_local = Local::now();
     let server_time = ServerTimeInfo {
         timestamp: now.timestamp(),
@@ -307,7 +330,7 @@ pub async fn get_login(
         timezone: now_local.format("%Z").to_string(),
     };
 
-    // ✅ 10. Log con nombre completo, rol ID y nombre del rol
+    // ✅ 11. Log con nombre completo, rol ID y nombre del rol
     let nombre_completo = [
         login_data.primer_nombre.as_str(),
         login_data.segundo_nombre.as_str()
@@ -329,13 +352,13 @@ pub async fn get_login(
         server_time,
     };
 
-    // ✅ 11. Resetear intentos después de login exitoso
+    // ✅ 12. Resetear intentos después de login exitoso
     {
         let mut attempts = state.login_attempts.lock().unwrap();
         attempts.remove(&client_ip);
     }
 
-    // ✅ 12. REGISTRAR LOG DE INICIO DE SESIÓN
+    // ✅ 13. REGISTRAR LOG DE INICIO DE SESIÓN
     let ip_origen = extract_ip(&req);
     let user_agent = extract_user_agent(&req);
 
