@@ -1,6 +1,7 @@
 // src/modules/login.rs
 use crate::structs;
 use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
+use crate::utils::security_monitor;
 use actix_web::{web, HttpResponse};
 use chrono::{Duration, Utc, Local, NaiveDate};
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -76,26 +77,45 @@ struct ErrorResponse {
 pub async fn get_captcha(
     state: web::Data<structs::AppState>,
 ) -> HttpResponse {
+    use chrono::Utc;
+    
     let mut rng = rand::thread_rng();
     
-    let num1 = rng.gen_range(1..10);
-    let num2 = rng.gen_range(1..10);
-    let result = num1 + num2;
+    // ✅ Operaciones variadas: +, -, *
+    let operations = ['+', '-', '*'];
+    let op = operations[rng.gen_range(0..operations.len())];
     
-    let id: String = (0..16)
+    // ✅ TIPO EXPLÍCITO para saturating_sub
+    let num1: i32 = rng.gen_range(1..15);
+    let num2: i32 = rng.gen_range(1..15);
+    
+    // ✅ Calcular resultado según operación
+    let result: i32 = match op {
+        '+' => num1 + num2,
+        '-' => num1.saturating_sub(num2),
+        '*' => num1 * num2,
+        _ => num1 + num2,
+    };
+    
+    // ✅ ID más largo (32 chars)
+    let id: String = (0..32)
         .map(|_| rng.sample(&rand::distributions::Alphanumeric) as char)
         .collect();
     
+    // ✅ Guardar con timestamp
     {
         let mut store = state.captcha_store.lock().unwrap();
-        store.insert(id.clone(), result.to_string());
+        store.insert(id.clone(), structs::CaptchaEntry {
+            answer: result.to_string(),
+            created_at: Utc::now(),
+        });
     }
     
-    info!("🧮 CAPTCHA generado: {} + {} = ?", num1, num2);
+    info!("🧮 CAPTCHA generado: {} {} {} = ?", num1, op, num2);
     
     HttpResponse::Ok().json(CaptchaResponse {
         id,
-        operation: format!("{} + {} = ?", num1, num2),
+        operation: format!("{} {} {} = ?", num1, op, num2),
     })
 }
 
@@ -112,13 +132,25 @@ pub async fn get_login(
     // 🍯 1. HONEYPOT
     if let Some(honeypot_value) = &info.honeypot {
         if !honeypot_value.is_empty() {
-            let client_ip = req
-                .headers()
-                .get("X-Forwarded-For")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("unknown");
+            let client_ip = extract_ip(&req);
             
-            warn!("🤖 BOT DETECTADO (Honeypot) - IP: {}, Cédula: {}", client_ip, cedula);
+            // ✅ INSERTAR LOG DE SEGURIDAD (id_tipo_accion=4, id_accion=15)
+            let log_entry = LogEntry {
+                id_tipo_accion: 4,  // SEGURIDAD
+                id_accion: 15,      // HONEYPOT ACTIVADO
+                id_usuario: None,
+                accion: "HONEYPOT ACTIVADO".to_string(),
+                cedula_relacionada: Some(cedula),
+                ip_origen: client_ip.clone(),
+                user_agent: extract_user_agent(&req),
+            };
+            let pool_clone = pool.clone();
+            tokio::spawn(async move {
+                let _ = registrar_log(&pool_clone, log_entry).await;
+            });
+            
+            security_monitor::alert_honeypot(&client_ip, Some(cedula));
+            
             return HttpResponse::BadRequest().json(ErrorResponse {
                 error: "Solicitud inválida".to_string(),
             });
@@ -140,7 +172,23 @@ pub async fn get_login(
             if tracker.count >= 5 {
                 let elapsed = Utc::now() - tracker.last_attempt;
                 if elapsed < Duration::minutes(15) {
-                    warn!("🚫 RATE LIMIT EXCEDIDO - IP: {}, Intentos: {}", client_ip, tracker.count);
+                    // ✅ INSERTAR LOG DE SEGURIDAD (id_tipo_accion=4, id_accion=17)
+                    let log_entry = LogEntry {
+                        id_tipo_accion: 4,  // SEGURIDAD
+                        id_accion: 17,      // RATE LIMIT EXCEDIDO
+                        id_usuario: None,
+                        accion: "RATE LIMIT EXCEDIDO".to_string(),
+                        cedula_relacionada: None,
+                        ip_origen: client_ip.clone(),
+                        user_agent: extract_user_agent(&req),
+                    };
+                    let pool_clone = pool.clone();
+                    tokio::spawn(async move {
+                        let _ = registrar_log(&pool_clone, log_entry).await;
+                    });
+                    
+                    security_monitor::alert_rate_limit(&client_ip, tracker.count);
+                    
                     return HttpResponse::TooManyRequests().json(ErrorResponse {
                         error: "Demasiados intentos. Espera 15 minutos.".to_string(),
                     });
@@ -151,36 +199,50 @@ pub async fn get_login(
         }
     }
 
-    // 🧮 3. CAPTCHA MATEMÁTICO
+    // 🧮 3. CAPTCHA MATEMÁTICO (CON EXPIRACIÓN Y ONE-TIME USE)
     if let Some(captcha_id) = &info.captcha_id {
         if let Some(captcha_answer) = &info.captcha_answer {
             let valid = {
-                let store = state.captcha_store.lock().unwrap();
-                if let Some(expected) = store.get(captcha_id) {
-                    expected == captcha_answer
+                let mut store = state.captcha_store.lock().unwrap();
+                
+                if let Some(entry) = store.get(captcha_id) {
+                    let elapsed = chrono::Utc::now() - entry.created_at;
+                    
+                    if elapsed > chrono::Duration::minutes(5) {
+                        store.remove(captcha_id);
+                        false
+                    } else {
+                        &entry.answer == captcha_answer
+                    }
                 } else {
                     false
                 }
             };
             
             if !valid {
-                warn!("❌ CAPTCHA incorrecto - Cédula: {}", cedula);
+                // ✅ INSERTAR LOG DE SEGURIDAD (id_tipo_accion=4, id_accion=16)
+                let log_entry = LogEntry {
+                    id_tipo_accion: 4,  // SEGURIDAD
+                    id_accion: 16,      // CAPTCHA INVÁLIDO
+                    id_usuario: None,
+                    accion: "CAPTCHA INVÁLIDO".to_string(),
+                    cedula_relacionada: Some(cedula),
+                    ip_origen: client_ip.clone(),
+                    user_agent: extract_user_agent(&req),
+                };
+                let pool_clone = pool.clone();
+                tokio::spawn(async move {
+                    let _ = registrar_log(&pool_clone, log_entry).await;
+                });
                 
-                {
-                    let mut attempts = state.login_attempts.lock().unwrap();
-                    let tracker = attempts.entry(client_ip.clone()).or_insert(structs::AttemptTracker {
-                        count: 0,
-                        last_attempt: Utc::now(),
-                    });
-                    tracker.count += 1;
-                    tracker.last_attempt = Utc::now();
-                }
+                security_monitor::alert_invalid_captcha(&client_ip, Some(cedula));
                 
                 return HttpResponse::BadRequest().json(ErrorResponse {
-                    error: "CAPTCHA incorrecto. Intente de nuevo.".to_string(),
+                    error: "CAPTCHA incorrecto o expirado. Intente de nuevo.".to_string(),
                 });
             }
             
+            // ✅ ONE-TIME USE: Remover tras uso exitoso
             {
                 let mut store = state.captcha_store.lock().unwrap();
                 store.remove(captcha_id);
@@ -270,8 +332,7 @@ pub async fn get_login(
         });
     }
 
-    // ✅ 8. ✅ NUEVO: VALIDAR FECHA DE CIERRE (si no es ADMINISTRADOR)
-    // Asumiendo que id_rol = 1 es ADMINISTRADOR
+    // ✅ 8. VALIDAR FECHA DE CIERRE (si no es ADMINISTRADOR)
     if login_data.id_rol != 1 {
         let fecha_cierre: Option<NaiveDate> = sqlx::query_scalar(
             "SELECT p_date FROM parametros WHERE nombre_parametro = 'fecha_cierre'"

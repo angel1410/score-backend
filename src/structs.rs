@@ -4,12 +4,18 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
+#[derive(Clone, Debug)]
+pub struct CaptchaEntry {
+    pub answer: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool_pg: PgPool,
     pub jwt_secret: String,
     pub login_attempts: Arc<Mutex<HashMap<String, AttemptTracker>>>,
-    pub captcha_store: Arc<Mutex<HashMap<String, String>>>,
+    pub captcha_store: Arc<Mutex<HashMap<String, CaptchaEntry>>>,
 }
 
 #[derive(Clone)]

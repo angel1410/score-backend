@@ -6,6 +6,7 @@ pub mod users;
 pub mod logging; 
 pub mod logs;
 pub mod parametros;
+pub mod security;
 
 // ✅ Login
 pub use login::{get_login, get_logout, get_captcha};
@@ -43,3 +44,6 @@ pub use parametros::{
     eliminar_parametro,
     get_fecha_cierre,
 };
+
+// ✅ Exportar funciones (si quieres usarlas directamente desde modules::)
+//pub use security::get_security_dashboard;

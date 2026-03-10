@@ -12,6 +12,11 @@ mod structs;
 
 // ✅ Módulos
 mod modules;
+mod utils; 
+
+// ✅ Middleware de seguridad
+mod middleware;
+use middleware::security_headers::SecurityHeaders;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -47,6 +52,7 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .wrap(SecurityHeaders)
             .wrap(
                 Cors::default()
                     .allowed_origin(allowed_origin.as_str())
@@ -99,7 +105,8 @@ async fn main() -> std::io::Result<()> {
                     .route("/parametros/{nombre}", web::get().to(modules::get_parametro_by_nombre))
                     .route("/parametros/{id}", web::put().to(modules::actualizar_parametro))
                     .route("/parametros/{id}", web::delete().to(modules::eliminar_parametro))
-                    .route("/parametros/fecha-cierre", web::get().to(modules::get_fecha_cierre)),
+                    .route("/parametros/fecha-cierre", web::get().to(modules::get_fecha_cierre))
+                    .route("/security/dashboard", web::get().to(modules::security::get_security_dashboard)),
             )
     })
     .bind(("127.0.0.1", 9000))?
