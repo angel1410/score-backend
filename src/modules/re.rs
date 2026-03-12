@@ -446,7 +446,7 @@ pub async fn get_elector(
 
     let ciudad: Option<String> = row.get(7).ok();
     let urbanizacion: Option<String> = row.get(8).ok();
-    let sector: Option<String> = row.get(9).ok();
+    let sector: Option<String> = row.get(8).ok();
     let avenida_calle: Option<String> = row.get(10).ok();
     let edificio_casa: Option<String> = row.get(11).ok();
     let apartamento: Option<String> = row.get(12).ok();
@@ -735,8 +735,9 @@ pub async fn get_elector(
     Ok(HttpResponse::Ok().json(resp))
 }
 
+
 // =====================
-// Lista de electores (para DataTable) - SIN LOGGING
+// Lista de electores (para DataTable) - PAGINADA SIN COUNT
 // =====================
 
 #[derive(Deserialize)]
@@ -749,6 +750,9 @@ pub struct ElectoresQuery {
     pub primer_apellido: Option<String>,
     pub segundo_apellido: Option<String>,
     pub codigo_centro: Option<String>,
+    pub global: Option<String>,
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
 }
 
 #[derive(serde::Serialize, Default)]
@@ -763,11 +767,20 @@ pub struct ElectorListaItem {
     pub codigo_centro: Option<String>,
 }
 
+#[derive(serde::Serialize, Default)]
+pub struct ElectoresPagedResponse {
+    pub items: Vec<ElectorListaItem>,
+    pub page: u32,
+    pub limit: u32,
+    pub has_more: bool,
+}
+
 fn normalize_date(input: Option<&str>) -> Option<String> {
     let s = input?.trim();
     if s.is_empty() {
         return None;
     }
+
     let binding = s
         .replace("--", "-")
         .replace("- -", "-")
@@ -819,6 +832,7 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
 
 pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResponse, Error> {
     let q = query.into_inner();
+
     let hay_dato = q.cedula.is_some()
         || q.fecha_nacimiento.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
         || q.primer_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
@@ -826,11 +840,18 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         || q.primer_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
         || q.segundo_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
         || q.codigo_centro.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-        || q.nacionalidad.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        || q.nacionalidad.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.global.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
 
     if !hay_dato {
         return Err(actix_web::error::ErrorBadRequest("Ingrese al menos un dato"));
     }
+
+    let page = q.page.unwrap_or(1).max(1);
+    let limit = q.limit.unwrap_or(9).clamp(1, 100);
+    let fetch_limit = limit + 1;
+    let offset = ((page - 1) * limit) as i64;
+    let end_row = offset + fetch_limit as i64;
 
     let conn = oracle_conn().map_err(|e| {
         log::error!("❌ Error conectando a Oracle: {}", e);
@@ -851,6 +872,7 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
             binds_str.push(("nacionalidad".into(), nac));
         }
     }
+
     if let Some(ced) = q.cedula {
         if ced <= 0 || ced > 99_999_999 {
             return Err(actix_web::error::ErrorBadRequest("cedula inválida"));
@@ -858,54 +880,111 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         from_where.push_str(" AND CEDULA = :cedula ");
         binds_i64.push(("cedula".into(), ced));
     }
+
     if let Some(fnac_input) = q.fecha_nacimiento.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         let iso = normalize_date(Some(fnac_input))
             .ok_or_else(|| actix_web::error::ErrorBadRequest("fecha_nacimiento inválida (YYYY-MM-DD)"))?;
         from_where.push_str(" AND FECHA = :fecha_nacimiento ");
         binds_str.push(("fecha_nacimiento".into(), iso));
     }
+
     if let Some(s) = q.primer_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         from_where.push_str(" AND UPPER(PRIMER_NOMBRE) = :primer_nombre ");
         binds_str.push(("primer_nombre".into(), eq_param(s)));
     }
+
     if let Some(s) = q.segundo_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         from_where.push_str(" AND UPPER(SEGUNDO_NOMBRE) = :segundo_nombre ");
         binds_str.push(("segundo_nombre".into(), eq_param(s)));
     }
+
     if let Some(s) = q.primer_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         from_where.push_str(" AND UPPER(PRIMER_APELLIDO) = :primer_apellido ");
         binds_str.push(("primer_apellido".into(), eq_param(s)));
     }
+
     if let Some(s) = q.segundo_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         from_where.push_str(" AND UPPER(SEGUNDO_APELLIDO) = :segundo_apellido ");
         binds_str.push(("segundo_apellido".into(), eq_param(s)));
     }
+
     if let Some(s) = q.codigo_centro.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND TO_CHAR(CODIGO_CENTRO_VOTACION) = :codigo_centro ");
-        binds_str.push(("codigo_centro".into(), s.to_string()));
+        match s.parse::<i64>() {
+            Ok(codigo) => {
+                from_where.push_str(" AND CODIGO_CENTRO_VOTACION = :codigo_centro ");
+                binds_i64.push(("codigo_centro".into(), codigo));
+            }
+            Err(_) => {
+                return Err(actix_web::error::ErrorBadRequest("codigo_centro inválido"));
+            }
+        }
     }
 
-    let mut params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
-    for (k, v) in &binds_str {
-        params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
-    }
-    for (k, v) in &binds_i64 {
-        params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
-    }
+
+if let Some(s) = q.global.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+    let g = format!("%{}%", s.trim().to_uppercase());
+    from_where.push_str(
+        " AND (
+            UPPER(NACIONALIDAD) LIKE :global
+            OR TO_CHAR(CEDULA) LIKE :global
+            OR UPPER(PRIMER_NOMBRE) LIKE :global
+            OR UPPER(SEGUNDO_NOMBRE) LIKE :global
+            OR UPPER(PRIMER_APELLIDO) LIKE :global
+            OR UPPER(SEGUNDO_APELLIDO) LIKE :global
+            OR TO_CHAR(FECHA) LIKE :global
+            OR TO_CHAR(CODIGO_CENTRO_VOTACION) LIKE :global
+        ) "
+    );
+    binds_str.push(("global".into(), g));
+}
 
     let sql_select = format!(
-        " SELECT NACIONALIDAD, CEDULA, PRIMER_NOMBRE, SEGUNDO_NOMBRE, PRIMER_APELLIDO, SEGUNDO_APELLIDO, FECHA, CODIGO_CENTRO_VOTACION {} ORDER BY CEDULA ",
+        r#"
+        SELECT *
+        FROM (
+            SELECT t_inner.*, ROWNUM rn
+            FROM (
+                SELECT
+                    NACIONALIDAD,
+                    CEDULA,
+                    PRIMER_NOMBRE,
+                    SEGUNDO_NOMBRE,
+                    PRIMER_APELLIDO,
+                    SEGUNDO_APELLIDO,
+                    FECHA,
+                    CODIGO_CENTRO_VOTACION
+                {}
+            ) t_inner
+            WHERE ROWNUM <= :end_row
+        )
+        WHERE rn > :offset
+        "#,
         from_where
     );
 
-    let t1 = Instant::now();
-    let mut rows_data = conn.query_named(&sql_select, &params).map_err(|e| {
+    let offset_holder = offset;
+    let end_row_holder = end_row;
+
+    let mut select_params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
+    for (k, v) in &binds_str {
+        select_params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
+    }
+    for (k, v) in &binds_i64 {
+        select_params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
+    }
+    select_params.push(("end_row", &end_row_holder as &dyn oracle::sql_type::ToSql));
+    select_params.push(("offset", &offset_holder as &dyn oracle::sql_type::ToSql));
+
+    let t_select = Instant::now();
+    let mut rows_data = conn.query_named(&sql_select, &select_params).map_err(|e| {
         log::error!("❌ Error SELECT: {}", e);
         actix_web::error::ErrorInternalServerError(format!("Error SELECT: {}", e))
     })?;
-    log::info!("⏱️ get_electores SELECT ms = {}", t1.elapsed().as_millis());
+    log::info!("⏱️ get_electores SELECT ms = {}", t_select.elapsed().as_millis());
 
+    let t_fetch = Instant::now();
     let mut items: Vec<ElectorListaItem> = Vec::new();
+
     while let Some(row) = rows_data.next().transpose().map_err(|e| {
         log::error!("❌ Error leyendo filas: {}", e);
         actix_web::error::ErrorInternalServerError(format!("Error leyendo filas: {}", e))
@@ -932,8 +1011,25 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         });
     }
 
-    Ok(HttpResponse::Ok().json(items))
+    let has_more = items.len() as u32 > limit;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+
+    log::info!(
+        "⏱️ get_electores FETCH rows={} ms = {}",
+        items.len(),
+        t_fetch.elapsed().as_millis()
+    );
+
+    Ok(HttpResponse::Ok().json(ElectoresPagedResponse {
+        items,
+        page,
+        limit,
+        has_more,
+    }))
 }
+
 
 // =====================
 // Votos a emitir CON LOGGING
