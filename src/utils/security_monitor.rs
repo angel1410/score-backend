@@ -21,6 +21,7 @@ pub enum SecurityEvent {
 pub struct AlertConfig {
     pub rate_limit_threshold: u32,
     pub rate_limit_window_minutes: u32,
+    #[allow(dead_code)]
     pub log_file: String,
 }
 

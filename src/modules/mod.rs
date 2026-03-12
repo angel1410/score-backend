@@ -3,10 +3,11 @@ pub mod login;
 pub mod re;
 pub mod ac;
 pub mod users;
-pub mod logging; 
+pub mod logging;
 pub mod logs;
 pub mod parametros;
 pub mod security;
+pub mod exportacion;  // ✅ Módulo consolidado de exportación/verificación
 
 // ✅ Login
 pub use login::{get_login, get_logout, get_captcha};
@@ -18,7 +19,7 @@ pub use re::{get_movimientos_re, get_elector, get_electores, get_votos_emitir};
 pub use ac::get_usuario_by_ac;
 
 // ✅ Logs de Auditoría
-//pub use logs::{get_logs, get_logs_resumen, get_carga_masiva_id_by_log};
+// pub use logs::{get_logs, get_logs_resumen, get_carga_masiva_id_by_log};
 
 // ✅ Usuarios (CRUD + Carga Masiva)
 pub use users::{
@@ -45,5 +46,5 @@ pub use parametros::{
     get_fecha_cierre,
 };
 
-// ✅ Exportar funciones (si quieres usarlas directamente desde modules::)
-//pub use security::get_security_dashboard;
+// ✅ Exportación y Verificación de documentos (CONSOLIDADO)
+pub use exportacion::{registrar_exportacion, verificar_documento};

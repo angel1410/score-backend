@@ -106,7 +106,9 @@ async fn main() -> std::io::Result<()> {
                     .route("/parametros/{id}", web::put().to(modules::actualizar_parametro))
                     .route("/parametros/{id}", web::delete().to(modules::eliminar_parametro))
                     .route("/parametros/fecha-cierre", web::get().to(modules::get_fecha_cierre))
-                    .route("/security/dashboard", web::get().to(modules::security::get_security_dashboard)),
+                    .route("/security/dashboard", web::get().to(modules::security::get_security_dashboard))
+                    .route("/exportar/reporte", web::post().to(modules::exportacion::registrar_exportacion))
+                    .route("/verificar/{codigo}", web::get().to(modules::exportacion::verificar_documento)),
             )
     })
     .bind(("127.0.0.1", 9000))?

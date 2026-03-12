@@ -81,8 +81,8 @@ pub async fn get_captcha(
     
     let mut rng = rand::thread_rng();
     
-    // ✅ Operaciones variadas: +, -, *
-    let operations = ['+', '-', '*'];
+    // ✅ Operaciones variadas: +, -
+    let operations = ['+', '-'];
     let op = operations[rng.gen_range(0..operations.len())];
     
     // ✅ TIPO EXPLÍCITO para saturating_sub
