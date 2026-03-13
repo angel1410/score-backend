@@ -267,6 +267,21 @@ fn pad9(n: i64) -> String {
     format!("{:09}", n)
 }
 
+fn normalize_codigo_centro_9<S: AsRef<str>>(s: S) -> Option<String> {
+    let trimmed = s.as_ref().trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+
+    let value = digits.parse::<i64>().ok()?;
+    Some(format!("{:09}", value))
+}
+
 fn clean_geo_desc(s: String) -> String {
     let mut t = s.trim().to_string();
     let upper = t.to_uppercase();
@@ -565,7 +580,9 @@ pub async fn get_elector(
         let cod_municipio_actual: Option<String> = r_actual_base.get(4).ok(); // distrito = municipio
         let cod_parroquia_actual: Option<String> = r_actual_base.get(5).ok(); // municipio = parroquia
 
-        resp.codigo_centro_actual = codigo_centro_actual_nuevo;
+        resp.codigo_centro_actual = codigo_centro_actual_nuevo
+            .as_deref()
+            .and_then(normalize_codigo_centro_9);
 
         if let (
             Some(codigo_centro_viejo),
@@ -909,34 +926,29 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
     }
 
     if let Some(s) = q.codigo_centro.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        match s.parse::<i64>() {
-            Ok(codigo) => {
-                from_where.push_str(" AND CODIGO_CENTRO_VOTACION = :codigo_centro ");
-                binds_i64.push(("codigo_centro".into(), codigo));
-            }
-            Err(_) => {
-                return Err(actix_web::error::ErrorBadRequest("codigo_centro inválido"));
-            }
-        }
+        let codigo = normalize_codigo_centro_9(s)
+            .ok_or_else(|| actix_web::error::ErrorBadRequest("codigo_centro inválido"))?;
+
+        from_where.push_str(" AND LPAD(TO_CHAR(CODIGO_CENTRO_VOTACION), 9, '0') = :codigo_centro ");
+        binds_str.push(("codigo_centro".into(), codigo));
     }
 
-
-if let Some(s) = q.global.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-    let g = format!("%{}%", s.trim().to_uppercase());
-    from_where.push_str(
-        " AND (
-            UPPER(NACIONALIDAD) LIKE :global
-            OR TO_CHAR(CEDULA) LIKE :global
-            OR UPPER(PRIMER_NOMBRE) LIKE :global
-            OR UPPER(SEGUNDO_NOMBRE) LIKE :global
-            OR UPPER(PRIMER_APELLIDO) LIKE :global
-            OR UPPER(SEGUNDO_APELLIDO) LIKE :global
-            OR TO_CHAR(FECHA) LIKE :global
-            OR TO_CHAR(CODIGO_CENTRO_VOTACION) LIKE :global
-        ) "
-    );
-    binds_str.push(("global".into(), g));
-}
+    if let Some(s) = q.global.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        let g = format!("%{}%", s.trim().to_uppercase());
+        from_where.push_str(
+            " AND (
+                UPPER(NACIONALIDAD) LIKE :global
+                OR TO_CHAR(CEDULA) LIKE :global
+                OR UPPER(PRIMER_NOMBRE) LIKE :global
+                OR UPPER(SEGUNDO_NOMBRE) LIKE :global
+                OR UPPER(PRIMER_APELLIDO) LIKE :global
+                OR UPPER(SEGUNDO_APELLIDO) LIKE :global
+                OR TO_CHAR(FECHA) LIKE :global
+                OR LPAD(TO_CHAR(CODIGO_CENTRO_VOTACION), 9, '0') LIKE :global
+            ) "
+        );
+        binds_str.push(("global".into(), g));
+    }
 
     let sql_select = format!(
         r#"
@@ -952,7 +964,7 @@ if let Some(s) = q.global.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
                     PRIMER_APELLIDO,
                     SEGUNDO_APELLIDO,
                     FECHA,
-                    CODIGO_CENTRO_VOTACION
+                    LPAD(TO_CHAR(CODIGO_CENTRO_VOTACION), 9, '0') AS CODIGO_CENTRO_VOTACION
                 {}
             ) t_inner
             WHERE ROWNUM <= :end_row
@@ -997,7 +1009,10 @@ if let Some(s) = q.global.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         let segundo_apellido: Option<String> = row.get(5).ok();
         let fecha_raw: Option<String> = row.get(6).ok();
         let fecha_iso = normalize_date(fecha_raw.as_deref());
-        let codigo_centro: Option<String> = row.get(7).ok();
+        let codigo_centro_raw: Option<String> = row.get(7).ok();
+        let codigo_centro = codigo_centro_raw
+            .as_deref()
+            .and_then(normalize_codigo_centro_9);
 
         items.push(ElectorListaItem {
             nacionalidad: nac,
