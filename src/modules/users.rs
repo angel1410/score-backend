@@ -392,7 +392,7 @@ async fn registrar_carga_masiva_detalle(
         r#"
         INSERT INTO carga_masiva_detalles
         (carga_masiva_id, usuario_id, cedula, nacionalidad, nombre_completo, username, estado, error_detalle)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        VALUES ($1, $2, $3, $4, UPPER($5), $6, $7, $8)
         "#
     )
     .bind(carga_masiva_id)
@@ -507,7 +507,7 @@ pub async fn crear_usuario(
     let user = match sqlx::query_as::<_, Usuario>(
         "INSERT INTO usuarios (nacionalidad, cedula, primer_nombre, segundo_nombre, primer_apellido, 
          segundo_apellido, username, password, activo, expira, id_rol, origen_creacion)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'MANUAL')
+         VALUES ($1, $2, UPPER($3), UPPER($4), UPPER($5), UPPER($6), $7, $8, $9, $10, $11, 'MANUAL')
          RETURNING id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre, 
                    primer_apellido, segundo_apellido, username, password, activo, expira"
     )
@@ -1128,7 +1128,7 @@ pub async fn confirmar_carga_masiva(
         let insert_result = sqlx::query(
             r#"INSERT INTO usuarios (nacionalidad, cedula, primer_nombre, segundo_nombre, 
                primer_apellido, segundo_apellido, username, password, activo, expira, id_rol, origen_creacion)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'CARGA_MASIVA')
+               VALUES ($1, $2, UPPER($3), UPPER($4), UPPER($5), UPPER($6), $7, $8, $9, $10, $11, 'CARGA_MASIVA')
                RETURNING id"#
         )
         .bind(&fila.nacionalidad)
