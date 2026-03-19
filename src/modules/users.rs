@@ -105,6 +105,7 @@ pub struct ACData {
     pub segundo_nombre: String,
     pub primer_apellido: String,
     pub segundo_apellido: String,
+    pub status_objecion: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,7 +272,7 @@ async fn consultar_ac(nacionalidad: &str, cedula: i32) -> Result<Option<ACData>,
         })?;
 
     let sql = "SELECT NACIONALIDAD, CEDULA, PRIMER_NOMBRE, NVL(SEGUNDO_NOMBRE, '') as SEGUNDO_NOMBRE, 
-                      PRIMER_APELLIDO, NVL(SEGUNDO_APELLIDO, '') as SEGUNDO_APELLIDO 
+                      PRIMER_APELLIDO, NVL(SEGUNDO_APELLIDO, '') as SEGUNDO_APELLIDO, STATUS_OBJECION 
                FROM RE.AC 
                WHERE NACIONALIDAD = :nacionalidad AND CEDULA = :cedula";
 
@@ -286,6 +287,7 @@ async fn consultar_ac(nacionalidad: &str, cedula: i32) -> Result<Option<ACData>,
             segundo_nombre: row.get(3).unwrap_or_default(),
             primer_apellido: row.get(4).unwrap_or_default(),
             segundo_apellido: row.get(5).unwrap_or_default(),
+            status_objecion: row.get(6).ok(),
         }))
     } else {
         Ok(None)
@@ -466,6 +468,19 @@ pub async fn crear_usuario(
     if cedula <= 0 || cedula > 99_999_999 {
         return HttpResponse::BadRequest().body("cedula inválida");
     }
+
+    // ✅ Después de obtener los datos de AC, validar si está fallecido
+if let Ok(Some(ac_data)) = consultar_ac(&nacionalidad, cedula).await {
+    // Verificar si tiene objeción de fallecido (3)
+    if ac_data.status_objecion == Some(3) {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "No se puede crear el usuario",
+            "codigo": "USUARIO_FALLECIDO",
+            "detalle": "La cédula consultada registra status de fallecido en el Registro Electoral"
+        }));
+    }
+}
+
 
     let usuario_existente = sqlx::query(
         r#"SELECT id, eliminado FROM usuarios WHERE nacionalidad = $1 AND cedula = $2 LIMIT 1"#
@@ -1036,6 +1051,17 @@ pub async fn confirmar_carga_masiva(
             }
         }
 
+// ✅ Dentro del procesamiento de cada fila en confirmar_carga_masiva
+if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
+    if ac_data.status_objecion == Some(3) {
+        fallidos += 1;
+        detalles.push(format!("Fila {}: Cédula {}-{} registra fallecido en AC", 
+            fila.fila, fila.nacionalidad, fila.cedula));
+        continue; // Saltar esta fila
+    }
+}
+
+
         // ✅ 3. Verificar duplicado por CEDULA (incluyendo eliminados)
         let cedula_existente = sqlx::query(
             "SELECT id, eliminado FROM usuarios WHERE nacionalidad = $1 AND cedula = $2"
@@ -1413,6 +1439,25 @@ async fn procesar_fila_preview(
 
     match consultar_ac(&nacionalidad, cedula).await {
         Ok(Some(ac_data)) => {
+if ac_data.status_objecion == Some(3) {
+            return FilaPreview {
+                fila,
+                nacionalidad,
+                cedula,
+                estado: "RECHAZADO".to_string(),
+                excel_primer_nombre,
+                excel_segundo_nombre,
+                excel_primer_apellido,
+                excel_segundo_apellido,
+                ac_primer_nombre: Some(ac_data.primer_nombre.clone()),
+                ac_segundo_nombre: Some(ac_data.segundo_nombre.clone()),
+                ac_primer_apellido: Some(ac_data.primer_apellido.clone()),
+                ac_segundo_apellido: Some(ac_data.segundo_apellido.clone()),
+                discrepancias: vec![],
+                mensaje_error: Some("⚠️ La cédula registra status de FALLECIDO en el Registro Electoral".to_string()),
+            };
+            }
+
             let mut fila_preview = FilaPreview {
                 fila,
                 nacionalidad,

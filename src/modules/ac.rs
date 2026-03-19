@@ -28,6 +28,7 @@ pub struct UsuarioAC {
     pub segundo_apellido: Option<String>,
     pub primer_nombre: Option<String>,
     pub segundo_nombre: Option<String>,
+    pub status_objecion: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -73,7 +74,8 @@ pub async fn get_usuario_by_ac(
           PRIMER_APELLIDO, 
           SEGUNDO_APELLIDO, 
           PRIMER_NOMBRE, 
-          SEGUNDO_NOMBRE 
+          SEGUNDO_NOMBRE,
+          STATUS_OBJECION
         FROM RE.AC
         WHERE NACIONALIDAD = :nacionalidad 
           AND CEDULA = :cedula
@@ -127,6 +129,7 @@ pub async fn get_usuario_by_ac(
         segundo_apellido: row.get(1).ok(),
         primer_nombre: row.get(2).ok(),
         segundo_nombre: row.get(3).ok(),
+        status_objecion: row.get(4).ok(),
     };
 
     info!("✅ Datos obtenidos: {:?}", usuario);
