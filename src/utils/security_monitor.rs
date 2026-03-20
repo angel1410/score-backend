@@ -1,4 +1,5 @@
 // src/utils/security_monitor.rs
+#![allow(dead_code)]
 use chrono::{DateTime, Utc, Duration};
 use log::{warn, error};
 use serde::{Deserialize, Serialize};

@@ -47,4 +47,4 @@ pub use parametros::{
 };
 
 // ✅ Exportación y Verificación de documentos (CONSOLIDADO)
-pub use exportacion::{registrar_exportacion, verificar_documento};
+//pub use exportacion::{registrar_exportacion, verificar_documento};
