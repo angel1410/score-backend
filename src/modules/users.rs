@@ -1731,3 +1731,5 @@ pub async fn descargar_carga_masiva_excel(
         .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", nombre_archivo)))
         .body(buffer)
 }
+
+// cambios en el AC: si status_objecion != 0 entonces RECHAZADO con mensaje de objeción
