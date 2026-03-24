@@ -247,6 +247,12 @@ fn generar_password(primer_nombre: &str, primer_apellido: &str, cedula: i32) -> 
     format!("{}{}{}", inicial_nombre, inicial_apellido, cedula)
 }
 
+fn validar_longitud_cedula(cedula: i32) -> bool {
+    let cedula_str = cedula.to_string();
+    cedula_str.len() >= 6 && cedula_str.len() <= 8
+}
+
+
 // ============================================
 // ✅ CONSULTAR AC CON DATOS COMPLETOS
 // ============================================
@@ -465,18 +471,25 @@ pub async fn crear_usuario(
     if !(nacionalidad == "V" || nacionalidad == "E") {
         return HttpResponse::BadRequest().body("nacionalidad debe ser V o E");
     }
+    if !validar_longitud_cedula(cedula) {
+    return HttpResponse::BadRequest().json(serde_json::json!({
+        "error": "Cédula inválida",
+        "codigo": "CEDULA_LONGITUD_INVALIDA",
+        "detalle": "Ingrese una cédula válida (6-8 dígitos)"
+    }));
+}
     if cedula <= 0 || cedula > 99_999_999 {
         return HttpResponse::BadRequest().body("cedula inválida");
     }
 
-    // ✅ Después de obtener los datos de AC, validar si está fallecido
+    // ✅ Después de obtener los datos de AC, validar si tiene objeción
 if let Ok(Some(ac_data)) = consultar_ac(&nacionalidad, cedula).await {
-    // Verificar si tiene objeción de fallecido (3)
-    if ac_data.status_objecion == Some(3) {
+    // Verificar si tiene objeción
+    if ac_data.status_objecion != Some(0) {
         return HttpResponse::BadRequest().json(serde_json::json!({
             "error": "No se puede crear el usuario",
-            "codigo": "USUARIO_FALLECIDO",
-            "detalle": "La cédula consultada registra status de fallecido en el Registro Electoral"
+            "codigo": "PRESENTA OBJECIÓN",
+            "detalle": "La cédula consultada presenta objeción en el AC"
         }));
     }
 }
@@ -964,6 +977,26 @@ pub async fn confirmar_carga_masiva(
         let password = generar_password(&fila.primer_nombre, &fila.primer_apellido, fila.cedula);
         let hashed_password = format!("{:x}", Sha256::digest(password.as_bytes()));
 
+    // ✅ NUEVO: Validar longitud de cédula (6-8 dígitos)
+    if !validar_longitud_cedula(fila.cedula) {
+        fallidos += 1;
+        detalles.push(format!("Fila {}: {}", fila.fila, "Ingrese una cédula válida (6-8 dígitos)"));
+        
+        if let Some(carga_id) = carga_masiva_id {
+            let _ = registrar_carga_masiva_detalle(
+                &app_state.pool_pg, 
+                carga_id, 
+                None, 
+                fila.cedula, 
+                &fila.nacionalidad,
+                &nombre_completo, 
+                Some(&username), 
+                "FALLIDO", 
+                Some("Cédula inválida: debe tener 6-8 dígitos"),
+            ).await;
+        }
+        continue; // Saltar esta fila
+    }
         // ✅ 1. Verificar si existe por USERNAME (incluyendo eliminados)
         let usuario_existente = sqlx::query(
             "SELECT id, eliminado FROM usuarios WHERE username = $1"
@@ -1053,9 +1086,9 @@ pub async fn confirmar_carga_masiva(
 
 // ✅ Dentro del procesamiento de cada fila en confirmar_carga_masiva
 if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
-    if ac_data.status_objecion == Some(3) {
+    if ac_data.status_objecion != Some(0) {
         fallidos += 1;
-        detalles.push(format!("Fila {}: Cédula {}-{} registra fallecido en AC", 
+        detalles.push(format!("Fila {}: Cédula {}-{} registra objeción en AC", 
             fila.fila, fila.nacionalidad, fila.cedula));
         continue; // Saltar esta fila
     }
@@ -1437,9 +1470,28 @@ async fn procesar_fila_preview(
         };
     }
 
+    if !validar_longitud_cedula(cedula) {
+        return FilaPreview {
+            fila,
+            nacionalidad,
+            cedula,
+            estado: "INVALIDO".to_string(),
+            excel_primer_nombre,
+            excel_segundo_nombre,
+            excel_primer_apellido,
+            excel_segundo_apellido,
+            ac_primer_nombre: None,
+            ac_segundo_nombre: None,
+            ac_primer_apellido: None,
+            ac_segundo_apellido: None,
+            discrepancias: vec![],
+            mensaje_error: Some("Ingrese una cédula válida (6-8 dígitos)".to_string()),
+        };
+    }
+
     match consultar_ac(&nacionalidad, cedula).await {
         Ok(Some(ac_data)) => {
-if ac_data.status_objecion == Some(3) {
+if ac_data.status_objecion != Some(0) {
             return FilaPreview {
                 fila,
                 nacionalidad,
@@ -1454,7 +1506,7 @@ if ac_data.status_objecion == Some(3) {
                 ac_primer_apellido: Some(ac_data.primer_apellido.clone()),
                 ac_segundo_apellido: Some(ac_data.segundo_apellido.clone()),
                 discrepancias: vec![],
-                mensaje_error: Some("⚠️ La cédula registra status de FALLECIDO en el Registro Electoral".to_string()),
+                mensaje_error: Some("⚠️ La cédula registra presenta objeción en el AC".to_string()),
             };
             }
 
