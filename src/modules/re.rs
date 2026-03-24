@@ -677,11 +677,15 @@ pub async fn get_elector(
 
 #[derive(Deserialize)]
 pub struct ElectoresQuery {
-    pub fecha_nacimiento: Option<String>,  // Formato: YYYY-MM-DD
+    pub nacionalidad: Option<String>,
+    pub cedula: Option<i64>,
+    pub fecha_nacimiento: Option<String>,
     pub primer_nombre: Option<String>,
     pub segundo_nombre: Option<String>,
     pub primer_apellido: Option<String>,
     pub segundo_apellido: Option<String>,
+    pub codigo_centro: Option<String>,
+    pub global: Option<String>,
     pub page: Option<u32>,
     pub limit: Option<u32>,
 }
@@ -706,183 +710,253 @@ pub struct ElectoresPagedResponse {
     pub has_more: bool,
 }
 
-// ✅ Parsear fecha ISO (YYYY-MM-DD) - DEFINIR SOLO UNA VEZ
-fn parse_fecha_iso(input: &str) -> Option<String> {
-    let s = input.trim();
-    if s.len() != 10 { return None; }
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 { return None; }
-    let (y, m, d) = (parts[0], parts[1], parts[2]);
-    if y.len() == 4 && m.len() == 2 && d.len() == 2
-        && y.chars().all(|c| c.is_ascii_digit())
-        && m.chars().all(|c| c.is_ascii_digit())
-        && d.chars().all(|c| c.is_ascii_digit()) {
-        let month: u32 = m.parse().ok()?;
-        let day: u32 = d.parse().ok()?;
-        if (1..=12).contains(&month) && (1..=31).contains(&day) {
-            return Some(s.to_string());
+fn normalize_date(input: Option<&str>) -> Option<String> {
+    let s = input?.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let binding = s
+        .replace("--", "-")
+        .replace("- -", "-")
+        .replace("  ", " ")
+        .replace("/", "-");
+    let clean = binding.trim();
+
+    if clean.contains('-') {
+        let parts: Vec<&str> = clean.split('-').filter(|p| !p.is_empty()).collect();
+        if parts.len() >= 3 {
+            let y = parts[0];
+            let m = parts[1];
+            let d = parts[2];
+            if y.len() == 4 && y.chars().all(|c| c.is_ascii_digit()) {
+                let mm: u32 = m.parse().ok()?;
+                let dd: u32 = d.parse().ok()?;
+                if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
+                    return Some(format!("{y}-{:02}-{:02}", mm, dd));
+                }
+            }
         }
     }
+
+    if clean.len() == 8 && clean.chars().all(|c| c.is_ascii_digit()) {
+        let y = &clean[0..4];
+        let m = &clean[4..6];
+        let d = &clean[6..8];
+        let mm: u32 = m.parse().ok()?;
+        let dd: u32 = d.parse().ok()?;
+        if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
+            return Some(format!("{y}-{m}-{d}"));
+        }
+    }
+
+    let digits: String = clean.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 8 {
+        let y = &digits[0..4];
+        let m = &digits[4..6];
+        let d = &digits[6..8];
+        let mm: u32 = m.parse().ok()?;
+        let dd: u32 = d.parse().ok()?;
+        if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
+            return Some(format!("{y}-{:02}-{:02}", mm, dd));
+        }
+    }
+
     None
-}
-
-// ✅ Construir WHERE dinámico con binds nombrados para Oracle - DEFINIR SOLO UNA VEZ
-fn build_optimized_where(query: &ElectoresQuery) -> (String, Vec<(&'static str, String)>) {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut binds: Vec<(&'static str, String)> = Vec::new();
-
-    // Fecha exacta
-    if let Some(fecha) = query.fecha_nacimiento.as_ref().filter(|s| !s.trim().is_empty()) {
-        if let Some(iso) = parse_fecha_iso(fecha) {
-            conditions.push("FECHA = :fecha_nacimiento".to_string());
-            binds.push(("fecha_nacimiento", iso));
-        }
-    }
-
-    // Nombres y apellidos (case-insensitive)
-    let nombre_fields = [
-        ("PRIMER_NOMBRE", "primer_nombre", &query.primer_nombre),
-        ("SEGUNDO_NOMBRE", "segundo_nombre", &query.segundo_nombre),
-        ("PRIMER_APELLIDO", "primer_apellido", &query.primer_apellido),
-        ("SEGUNDO_APELLIDO", "segundo_apellido", &query.segundo_apellido),
-    ];
-
-    for (col_db, placeholder, value) in nombre_fields {
-        if let Some(val) = value.as_ref().filter(|s| !s.trim().is_empty()) {
-            let upper_val = val.trim().to_uppercase();
-            conditions.push(format!("UPPER({}) = :{}", col_db, placeholder));
-            binds.push((placeholder, upper_val));
-        }
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!(" AND {}", conditions.join(" AND "))
-    };
-
-    (where_clause, binds)
 }
 
 // ✅ Función principal get_electores - COMPLETA Y CORREGIDA
 pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResponse, Error> {
     let q = query.into_inner();
 
-    // ✅ Validar búsqueda
-    let hay_busqueda = q.fecha_nacimiento.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+    let hay_dato = q.cedula.is_some()
+        || q.fecha_nacimiento.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
         || q.primer_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
         || q.segundo_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
         || q.primer_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-        || q.segundo_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        || q.segundo_apellido.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.codigo_centro.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.nacionalidad.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        || q.global.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
 
-    if !hay_busqueda {
-        return Err(actix_web::error::ErrorBadRequest(
-            "Ingrese al menos: fecha_nacimiento (YYYY-MM-DD) o un nombre/apellido"
-        ));
+    if !hay_dato {
+        return Err(actix_web::error::ErrorBadRequest("Ingrese al menos un dato"));
     }
 
-    // ✅ Paginación
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(9).clamp(1, 100);
+    let fetch_limit = limit + 1;
     let offset = ((page - 1) * limit) as i64;
-    let end_row = offset + limit as i64;  // ✅ Calcular fila final
+    let end_row = offset + fetch_limit as i64;
 
     let conn = oracle_conn().map_err(|e| {
-        log::error!("❌ Error Oracle: {}", e);
-        actix_web::error::ErrorInternalServerError("Error conectando a Oracle")
+        log::error!("❌ Error conectando a Oracle: {}", e);
+        actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e))
     })?;
 
-    // ✅ Construir WHERE y binds nombrados
-    let (where_clause, binds_vec) = build_optimized_where(&q);
+    let mut from_where = String::from(" FROM V_RE_ACTUAL_CVA WHERE 1=1 ");
+    let mut binds_str: Vec<(String, String)> = vec![];
+    let mut binds_i64: Vec<(String, i64)> = vec![];
 
-    // ✅ Query con ROWNUM (compatible con Oracle)
-    let sql = format!(
+    fn eq_param(s: &str) -> String {
+        s.trim().to_uppercase()
+    }
+
+    if let Some(nac) = q.nacionalidad.as_ref().map(|x| x.trim().to_uppercase()) {
+        if nac == "V" || nac == "E" {
+            from_where.push_str(" AND NACIONALIDAD = :nacionalidad ");
+            binds_str.push(("nacionalidad".into(), nac));
+        }
+    }
+
+    if let Some(ced) = q.cedula {
+        if ced <= 0 || ced > 99_999_999 {
+            return Err(actix_web::error::ErrorBadRequest("cedula inválida"));
+        }
+        from_where.push_str(" AND CEDULA = :cedula ");
+        binds_i64.push(("cedula".into(), ced));
+    }
+
+    if let Some(fnac_input) = q.fecha_nacimiento.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        let iso = normalize_date(Some(fnac_input))
+            .ok_or_else(|| actix_web::error::ErrorBadRequest("fecha_nacimiento inválida (YYYY-MM-DD)"))?;
+        from_where.push_str(" AND FECHA = :fecha_nacimiento ");
+        binds_str.push(("fecha_nacimiento".into(), iso));
+    }
+
+    if let Some(s) = q.primer_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        from_where.push_str(" AND UPPER(PRIMER_NOMBRE) = :primer_nombre ");
+        binds_str.push(("primer_nombre".into(), eq_param(s)));
+    }
+
+    if let Some(s) = q.segundo_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        from_where.push_str(" AND UPPER(SEGUNDO_NOMBRE) = :segundo_nombre ");
+        binds_str.push(("segundo_nombre".into(), eq_param(s)));
+    }
+
+    if let Some(s) = q.primer_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        from_where.push_str(" AND UPPER(PRIMER_APELLIDO) = :primer_apellido ");
+        binds_str.push(("primer_apellido".into(), eq_param(s)));
+    }
+
+    if let Some(s) = q.segundo_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        from_where.push_str(" AND UPPER(SEGUNDO_APELLIDO) = :segundo_apellido ");
+        binds_str.push(("segundo_apellido".into(), eq_param(s)));
+    }
+
+    if let Some(s) = q.codigo_centro.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+        match s.parse::<i64>() {
+            Ok(codigo) => {
+                from_where.push_str(" AND CODIGO_CENTRO_VOTACION = :codigo_centro ");
+                binds_i64.push(("codigo_centro".into(), codigo));
+            }
+            Err(_) => {
+                return Err(actix_web::error::ErrorBadRequest("codigo_centro inválido"));
+            }
+        }
+    }
+
+
+if let Some(s) = q.global.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+    let g = format!("%{}%", s.trim().to_uppercase());
+    from_where.push_str(
+        " AND (
+            UPPER(NACIONALIDAD) LIKE :global
+            OR TO_CHAR(CEDULA) LIKE :global
+            OR UPPER(PRIMER_NOMBRE) LIKE :global
+            OR UPPER(SEGUNDO_NOMBRE) LIKE :global
+            OR UPPER(PRIMER_APELLIDO) LIKE :global
+            OR UPPER(SEGUNDO_APELLIDO) LIKE :global
+            OR TO_CHAR(FECHA) LIKE :global
+            OR TO_CHAR(CODIGO_CENTRO_VOTACION) LIKE :global
+        ) "
+    );
+    binds_str.push(("global".into(), g));
+}
+
+    let sql_select = format!(
         r#"
-        SELECT * FROM (
-            SELECT t.*, ROWNUM rn FROM (
+        SELECT *
+        FROM (
+            SELECT t_inner.*, ROWNUM rn
+            FROM (
                 SELECT
-                    NACIONALIDAD, CEDULA,
-                    PRIMER_NOMBRE, SEGUNDO_NOMBRE,
-                    PRIMER_APELLIDO, SEGUNDO_APELLIDO,
+                    NACIONALIDAD,
+                    CEDULA,
+                    PRIMER_NOMBRE,
+                    SEGUNDO_NOMBRE,
+                    PRIMER_APELLIDO,
+                    SEGUNDO_APELLIDO,
                     FECHA,
                     CODIGO_CENTRO_VOTACION
-                FROM MV_RE_ACTUAL_CVA
-                WHERE 1=1{}
-                ORDER BY CEDULA
-            ) t
+                {}
+            ) t_inner
             WHERE ROWNUM <= :end_row
         )
         WHERE rn > :offset
         "#,
-        where_clause
+        from_where
     );
 
-    // ✅ Preparar parámetros NOMBRADOS
-    let mut params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
-    
-    // Agregar binds del WHERE
-    for (name, value) in &binds_vec {
-        params.push((name, value as &dyn oracle::sql_type::ToSql));
+    let offset_holder = offset;
+    let end_row_holder = end_row;
+
+    let mut select_params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
+    for (k, v) in &binds_str {
+        select_params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
     }
-    
-    // ✅ Agregar paginación con ROWNUM
-    params.push(("end_row", &end_row));
-    params.push(("offset", &offset));
+    for (k, v) in &binds_i64 {
+        select_params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
+    }
+    select_params.push(("end_row", &end_row_holder as &dyn oracle::sql_type::ToSql));
+    select_params.push(("offset", &offset_holder as &dyn oracle::sql_type::ToSql));
 
-    // ✅ Ejecutar query
-    let t_start = Instant::now();
-    let mut rows_data = conn.query_named(&sql, &params).map_err(|e| {
-        log::error!("❌ Error query_named: {}", e);
-        actix_web::error::ErrorInternalServerError("Error ejecutando query")
+    let t_select = Instant::now();
+    let mut rows_data = conn.query_named(&sql_select, &select_params).map_err(|e| {
+        log::error!("❌ Error SELECT: {}", e);
+        actix_web::error::ErrorInternalServerError(format!("Error SELECT: {}", e))
     })?;
+    log::info!("⏱️ get_electores SELECT ms = {}", t_select.elapsed().as_millis());
 
-    // ✅ Procesar resultados
+    let t_fetch = Instant::now();
     let mut items: Vec<ElectorListaItem> = Vec::new();
-    while let Some(row_result) = rows_data.next().transpose().map_err(|e| {
+
+    while let Some(row) = rows_data.next().transpose().map_err(|e| {
         log::error!("❌ Error leyendo filas: {}", e);
-        actix_web::error::ErrorInternalServerError("Error leyendo datos")
+        actix_web::error::ErrorInternalServerError(format!("Error leyendo filas: {}", e))
     })? {
-        let row: oracle::Row = row_result;
+        let nac: String = row.get(0).unwrap_or_else(|_| "V".to_string());
+        let ced: i64 = row.get(1).unwrap_or(0);
+        let primer_nombre: Option<String> = row.get(2).ok();
+        let segundo_nombre: Option<String> = row.get(3).ok();
+        let primer_apellido: Option<String> = row.get(4).ok();
+        let segundo_apellido: Option<String> = row.get(5).ok();
+        let fecha_raw: Option<String> = row.get(6).ok();
+        let fecha_iso = normalize_date(fecha_raw.as_deref());
+        let codigo_centro: Option<String> = row.get(7).ok();
+
         items.push(ElectorListaItem {
-            nacionalidad: row.get::<_, Option<String>>(0).unwrap_or_else(|_| Some("V".into())).unwrap(),
-            cedula: row.get::<_, Option<i64>>(1).unwrap_or(Some(0)).unwrap_or(0),
-            primer_nombre: row.get::<_, Option<String>>(2).ok().flatten(),
-            segundo_nombre: row.get::<_, Option<String>>(3).ok().flatten(),
-            primer_apellido: row.get::<_, Option<String>>(4).ok().flatten(),
-            segundo_apellido: row.get::<_, Option<String>>(5).ok().flatten(),
-            fecha_nacimiento: row.get::<_, Option<String>>(6).ok().flatten(),
-            codigo_centro: row.get::<_, Option<String>>(7).ok().flatten(),
+            nacionalidad: nac,
+            cedula: ced,
+            fecha_nacimiento: fecha_iso,
+            primer_nombre,
+            segundo_nombre,
+            primer_apellido,
+            segundo_apellido,
+            codigo_centro,
         });
     }
 
-    let elapsed = t_start.elapsed().as_millis();
-    log::info!("⏱️ get_electores: {} rows en {}ms", items.len(), elapsed);
+    let has_more = items.len() as u32 > limit;
+    if has_more {
+        items.truncate(limit as usize);
+    }
 
-    // ✅ Detectar has_more
-    let has_more = if items.len() as u32 == limit {
-        let count_sql = format!(
-            r#"SELECT COUNT(*) FROM MV_RE_ACTUAL_CVA WHERE 1=1{}"#,
-            where_clause
-        );
-        
-        let count_params: Vec<&dyn oracle::sql_type::ToSql> = binds_vec
-            .iter()
-            .map(|(_, value)| value as &dyn oracle::sql_type::ToSql)
-            .collect();
-        
-        match conn.query_as::<(i64,)>(&count_sql, &count_params) {
-            Ok(mut count_rows) => {
-                if let Some(Ok((total,))) = count_rows.next() {
-                    total > end_row
-                } else {
-                    false
-                }
-            }
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
+    log::info!(
+        "⏱️ get_electores FETCH rows={} ms = {}",
+        items.len(),
+        t_fetch.elapsed().as_millis()
+    );
 
     Ok(HttpResponse::Ok().json(ElectoresPagedResponse {
         items,
