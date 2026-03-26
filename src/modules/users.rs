@@ -1,4 +1,5 @@
 // src/modules/users.rs
+#![allow(dead_code)] 
 use actix_web::{web, HttpResponse, Responder, Error};
 use actix_multipart::Multipart;
 use sqlx::FromRow;
