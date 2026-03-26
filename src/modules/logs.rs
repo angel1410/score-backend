@@ -17,6 +17,10 @@ pub struct LogEntryResponse {
     pub created_at: chrono::NaiveDateTime,
     pub username: Option<String>,
     pub nombre_rol: Option<String>,
+    pub primer_nombre: Option<String>,
+    pub primer_apellido: Option<String>,
+    pub cedula: Option<i32>,
+    pub nacionalidad: Option<String>
 }
 
 #[derive(FromRow, Serialize, Deserialize, Debug)]
@@ -59,7 +63,11 @@ pub async fn get_logs(
             l.user_agent,
             l.created_at,
             u.username,
-            r.nombre_rol
+            r.nombre_rol,
+            u.primer_nombre,
+            u.primer_apellido,
+            u.cedula,
+            u.nacionalidad
         FROM logs l
         LEFT JOIN usuarios u ON l.id_usuario = u.id
         LEFT JOIN roles r ON u.id_rol = r.id
@@ -90,6 +98,7 @@ pub async fn get_logs(
     if let Some(fecha_hasta) = &filters.fecha_hasta {
         query.push_str(&format!(" AND l.created_at <= '{}'", fecha_hasta));
     }
+
 
     // ✅ MEJORADO: Filtro por accion (MULTIPLE)
     if let Some(accion) = &filters.accion {

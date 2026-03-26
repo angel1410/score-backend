@@ -908,12 +908,8 @@ pub async fn validar_carga_masiva(
         return HttpResponse::BadRequest().body("Archivo excede 5MB");
     }
 
-    let result = if file_name.ends_with(".csv") {
-        validar_csv_preview(&file_buffer, app_state.clone()).await
-    } else if file_name.ends_with(".xlsx") {
+    let result = if file_name.ends_with(".xlsx") {
         validar_xlsx_preview(&file_buffer, app_state.clone()).await
-    } else if file_name.ends_with(".xls") {
-        validar_xls_preview(&file_buffer, app_state.clone()).await
     } else {
         return HttpResponse::BadRequest().body("Formato no soportado");
     };
