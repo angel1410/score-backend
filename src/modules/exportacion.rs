@@ -1,7 +1,8 @@
 // src/modules/exportacion.rs
+#![allow(dead_code)] 
 use actix_web::{web, HttpResponse, Responder, HttpRequest};
 use serde::{Deserialize, Serialize};
-use chrono::{Local, TimeZone, FixedOffset};
+use chrono::{FixedOffset};
 use crate::structs::AppState;
 use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
 
@@ -54,7 +55,7 @@ pub async fn registrar_exportacion(
     let tz = FixedOffset::west_opt(4 * 3600).unwrap();
     let ahora_utc = chrono::Utc::now();
     let timestamp = ahora_utc.timestamp();
-    let fecha_formateada = ahora_utc
+    let _fecha_formateada = ahora_utc
         .with_timezone(&tz)
         .format("%d/%m/%Y, %I:%M:%S %p")
         .to_string();
