@@ -1044,7 +1044,7 @@ if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
                         Ok(_) => {
                             exitosos += 1;
                             reactivados += 1;
-                            detalles.push(format!("Fila {}: Usuario {} {} REACTIVADO por cédula (username: {})", 
+                            detalles.push(format!("Fila {}: Usuario {} {} REACTIVADO por cédula (usuario: {})", 
                                 fila.fila, fila.primer_nombre, fila.primer_apellido, username));
                             
                             if let Some(carga_id) = carga_masiva_id {
