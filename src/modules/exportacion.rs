@@ -1,7 +1,7 @@
 // src/modules/exportacion.rs
 use actix_web::{web, HttpResponse, Responder, HttpRequest};
 use serde::{Deserialize, Serialize};
-use chrono::Utc;
+use chrono::{Local, TimeZone, FixedOffset};
 use crate::structs::AppState;
 use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
 
@@ -51,7 +51,14 @@ pub async fn registrar_exportacion(
     );
 
     // ✅ Generar código de verificación único
-    let timestamp = Utc::now().timestamp();
+    let tz = FixedOffset::west_opt(4 * 3600).unwrap();
+    let ahora_utc = chrono::Utc::now();
+    let timestamp = ahora_utc.timestamp();
+    let fecha_formateada = ahora_utc
+        .with_timezone(&tz)
+        .format("%d/%m/%Y, %I:%M:%S %p")
+        .to_string();
+
     let codigo_verificacion = format!("RE-{}-{}", timestamp, info.cedula);
 
     // ✅ Registrar log de exportación (usar id_accion=9 que ya existe)
@@ -98,7 +105,9 @@ pub async fn verificar_documento(
 
     // Extraer cédula del código (última parte)
     let cedula = partes[partes.len() - 1];
-    
+    let timestamp_str = partes[1];
+    let timestamp: Option<i64> = timestamp_str.parse().ok();
+
     // ✅ Buscar en logs si existe esta exportación
     let existe = sqlx::query!(
         r#"
@@ -122,6 +131,7 @@ pub async fn verificar_documento(
                 "mensaje": "Documento verificado correctamente",
                 "codigo": codigo.to_string(),
                 "cedula": cedula,
+                "timestamp":timestamp,
                 "ultima_exportacion": row.ultima_exportacion
             }))
         },
