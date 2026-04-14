@@ -1,22 +1,22 @@
-// src/modules/users.rs
-#![allow(dead_code)] 
-use actix_web::{web, HttpResponse, Responder, Error};
+#![allow(dead_code)]
 use actix_multipart::Multipart;
+use actix_web::{web, Error, HttpResponse, Responder};
+use calamine::{DataType as CalamineDataType, Reader, Xls, Xlsx};
+use csv::ReaderBuilder;
+use futures_util::TryStreamExt;
+use log::info;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 use sqlx::Row;
-use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::PathBuf;
-use log::info;
-use csv::ReaderBuilder;
-use calamine::{DataType as CalamineDataType, Reader, Xls, Xlsx};
-use futures_util::TryStreamExt;
-use sha2::{Sha256, Digest};
-use log;
+
+use crate::middleware::auth::{get_current_user_id, require_admin_or_sistemas};
 use crate::structs::AppState;
 
 // ============================================
-// ✅ ESTRUCTURAS
+// ESTRUCTURAS
 // ============================================
 
 #[derive(FromRow, Serialize, Deserialize, Debug, Clone)]
@@ -78,7 +78,6 @@ pub struct UsuarioConPassword {
     pub password_generada: String,
 }
 
-// ✅ ESTRUCTURA PARA RESULTADO DE CARGA MASIVA (CON REACTIVADOS)
 #[derive(Serialize)]
 pub struct CargaMasivaResultado {
     pub exitosos: usize,
@@ -88,14 +87,13 @@ pub struct CargaMasivaResultado {
     pub carga_masiva_id: Option<i32>,
 }
 
-// ✅ Respuesta de error (UNA SOLA VEZ)
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
 }
 
 // ============================================
-// ✅ ESTRUCTURAS PARA VALIDACIÓN CON DISCREPANCIAS
+// ESTRUCTURAS PARA VALIDACIÓN CON DISCREPANCIAS
 // ============================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,7 +119,7 @@ pub struct FilaPreview {
     pub fila: usize,
     pub nacionalidad: String,
     pub cedula: i32,
-    pub estado: String,  // "VALIDO", "DISCREPANCIA", "INVALIDO", "RECHAZADO"
+    pub estado: String,
     pub excel_primer_nombre: String,
     pub excel_segundo_nombre: String,
     pub excel_primer_apellido: String,
@@ -164,7 +162,7 @@ pub struct FilaConfirmar {
 }
 
 // ============================================
-// ✅ ESTRUCTURAS PARA DESCARGAR EXCEL
+// ESTRUCTURAS PARA DESCARGAR EXCEL
 // ============================================
 
 #[derive(FromRow, Serialize, Deserialize, Debug)]
@@ -182,46 +180,11 @@ pub struct CargaMasivaDetalle {
 }
 
 // ============================================
-// ✅ HELPERS
+// HELPERS
 // ============================================
 
-async fn obtener_id_usuario_del_token(
-    req: &actix_web::HttpRequest,
-    app_state: &AppState,
-) -> Result<i32, String> {
-    use jsonwebtoken::{decode, DecodingKey, Validation};
-    
-    #[derive(Debug, Deserialize)]
-    #[allow(dead_code)]
-    struct Claims {
-        sub: String,
-        exp: usize,
-        iat: usize,
-    }
-
-    let token = req
-        .headers()
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .unwrap_or("");
-
-    if token.is_empty() {
-        return Err("Token no encontrado".to_string());
-    }
-
-    match decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(app_state.jwt_secret.as_bytes()),
-        &Validation::default()
-    ) {
-        Ok(token_data) => {
-            let user_id = token_data.claims.sub.parse::<i32>()
-                .map_err(|_| "ID inválido en token")?;
-            Ok(user_id)
-        }
-        Err(_) => Err("Token inválido".to_string())
-    }
+fn obtener_id_usuario_del_token(req: &actix_web::HttpRequest) -> Result<i32, String> {
+    get_current_user_id(req).map_err(|_| "Token inválido".to_string())
 }
 
 fn generar_username(primer_nombre: &str, primer_apellido: &str, _cedula: i32) -> String {
@@ -253,40 +216,48 @@ fn validar_longitud_cedula(cedula: i32) -> bool {
     cedula_str.len() >= 6 && cedula_str.len() <= 8
 }
 
-
 // ============================================
-// ✅ CONSULTAR AC CON DATOS COMPLETOS
+// CONSULTAR AC CON DATOS COMPLETOS
 // ============================================
 
 async fn consultar_ac(nacionalidad: &str, cedula: i32) -> Result<Option<ACData>, String> {
     use oracle::Connection;
     use std::env;
 
-    let username = env::var("ORACLE_USER").map_err(|e| format!("ORACLE_USER no configurado: {}", e))?;
-    let password = env::var("ORACLE_PASS").map_err(|e| format!("ORACLE_PASS no configurado: {}", e))?;
-    let oracle_ip = env::var("ORACLE_IP").map_err(|e| format!("ORACLE_IP no configurado: {}", e))?;
-    let oracle_port = env::var("ORACLE_PORT").map_err(|e| format!("ORACLE_PORT no configurado: {}", e))?;
-    let oracle_db = env::var("ORACLE_DB").map_err(|e| format!("ORACLE_DB no configurado: {}", e))?;
+    let username =
+        env::var("ORACLE_USER").map_err(|e| format!("ORACLE_USER no configurado: {}", e))?;
+    let password =
+        env::var("ORACLE_PASS").map_err(|e| format!("ORACLE_PASS no configurado: {}", e))?;
+    let oracle_ip =
+        env::var("ORACLE_IP").map_err(|e| format!("ORACLE_IP no configurado: {}", e))?;
+    let oracle_port =
+        env::var("ORACLE_PORT").map_err(|e| format!("ORACLE_PORT no configurado: {}", e))?;
+    let oracle_db =
+        env::var("ORACLE_DB").map_err(|e| format!("ORACLE_DB no configurado: {}", e))?;
 
     log::info!("🔗 Oracle: {}@{}:{}/{}", username, oracle_ip, oracle_port, oracle_db);
 
     let connect_string = format!("//{}:{}/{}", oracle_ip, oracle_port, oracle_db);
 
-    let conn = Connection::connect(&username, &password, &connect_string)
-        .map_err(|e| {
-            log::error!("❌ Error Oracle: {}", e);
-            format!("Error conectando a Oracle: {}", e)
-        })?;
+    let conn = Connection::connect(&username, &password, &connect_string).map_err(|e| {
+        log::error!("❌ Error Oracle: {}", e);
+        format!("Error conectando a Oracle: {}", e)
+    })?;
 
-    let sql = "SELECT NACIONALIDAD, CEDULA, PRIMER_NOMBRE, NVL(SEGUNDO_NOMBRE, '') as SEGUNDO_NOMBRE, 
-                      PRIMER_APELLIDO, NVL(SEGUNDO_APELLIDO, '') as SEGUNDO_APELLIDO, STATUS_OBJECION 
-               FROM RE.AC 
+    let sql = "SELECT NACIONALIDAD, CEDULA, PRIMER_NOMBRE, NVL(SEGUNDO_NOMBRE, '') as SEGUNDO_NOMBRE,
+                      PRIMER_APELLIDO, NVL(SEGUNDO_APELLIDO, '') as SEGUNDO_APELLIDO, STATUS_OBJECION
+               FROM RE.AC
                WHERE NACIONALIDAD = :nacionalidad AND CEDULA = :cedula";
 
-    let mut cursor = conn.query(sql, &[&nacionalidad, &cedula])
+    let mut cursor = conn
+        .query(sql, &[&nacionalidad, &cedula])
         .map_err(|e| format!("Error query AC: {}", e))?;
 
-    if let Some(row) = cursor.next().transpose().map_err(|e| format!("Error leyendo AC: {}", e))? {
+    if let Some(row) = cursor
+        .next()
+        .transpose()
+        .map_err(|e| format!("Error leyendo AC: {}", e))?
+    {
         Ok(Some(ACData {
             nacionalidad: row.get(0).unwrap_or_else(|_| nacionalidad.to_string()),
             cedula: row.get(1).unwrap_or(cedula),
@@ -302,15 +273,19 @@ async fn consultar_ac(nacionalidad: &str, cedula: i32) -> Result<Option<ACData>,
 }
 
 // ============================================
-// ✅ COMPARAR DATOS EXCEL VS AC
+// COMPARAR DATOS EXCEL VS AC
 // ============================================
 
 fn comparar_datos(excel: &FilaPreview, ac: &ACData) -> Vec<Discrepancia> {
     let mut discrepancias = Vec::new();
     let normalize = |s: &str| -> String {
         s.to_uppercase()
-            .replace('Á', "A").replace('É', "E").replace('Í', "I")
-            .replace('Ó', "O").replace('Ú', "U").replace('Ñ', "N")
+            .replace('Á', "A")
+            .replace('É', "E")
+            .replace('Í', "I")
+            .replace('Ó', "O")
+            .replace('Ú', "U")
+            .replace('Ñ', "N")
             .trim()
             .to_string()
     };
@@ -347,7 +322,7 @@ fn comparar_datos(excel: &FilaPreview, ac: &ACData) -> Vec<Discrepancia> {
 }
 
 // ============================================
-// ✅ AUDITORÍA DE CARGA MASIVA
+// AUDITORÍA DE CARGA MASIVA
 // ============================================
 
 async fn registrar_carga_masiva_log(
@@ -369,7 +344,7 @@ async fn registrar_carga_masiva_log(
         (id_usuario, archivo_nombre, archivo_tipo, archivo_size, total_filas, exitosos, fallidos, detalles, ip_origen, user_agent)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id
-        "#
+        "#,
     )
     .bind(&id_usuario)
     .bind(archivo_nombre)
@@ -402,7 +377,7 @@ async fn registrar_carga_masiva_detalle(
         INSERT INTO carga_masiva_detalles
         (carga_masiva_id, usuario_id, cedula, nacionalidad, nombre_completo, username, estado, error_detalle)
         VALUES ($1, $2, $3, $4, UPPER($5), $6, $7, $8)
-        "#
+        "#,
     )
     .bind(carga_masiva_id)
     .bind(&usuario_id)
@@ -418,19 +393,27 @@ async fn registrar_carga_masiva_detalle(
 }
 
 // ============================================
-// ✅ CRUD USUARIOS
+// CRUD USUARIOS
 // ============================================
 
-pub async fn get_usuarios(app_state: web::Data<AppState>) -> impl Responder {
+pub async fn get_usuarios(
+    req: actix_web::HttpRequest,
+    app_state: web::Data<AppState>,
+) -> impl Responder {
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
     match sqlx::query_as::<_, UsuarioConRol>(
         "SELECT u.id, u.id_rol, COALESCE(r.nombre_rol, 'Sin Rol') AS nombre_rol,
                 u.nacionalidad, u.cedula, u.primer_nombre, u.segundo_nombre,
                 u.primer_apellido, u.segundo_apellido, u.username, u.activo, u.expira
          FROM usuarios u LEFT JOIN roles r ON u.id_rol = r.id
-         WHERE u.eliminado = FALSE ORDER BY u.id DESC"
+         WHERE u.eliminado = FALSE ORDER BY u.id DESC",
     )
     .fetch_all(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(users) => HttpResponse::Ok().json(users),
         Err(e) => {
             log::error!("Error al obtener usuarios: {}", e);
@@ -442,12 +425,18 @@ pub async fn get_usuarios(app_state: web::Data<AppState>) -> impl Responder {
     }
 }
 
-pub async fn get_roles(app_state: web::Data<AppState>) -> impl Responder {
-    match sqlx::query_as::<_, (i32, String)>(
-        "SELECT id, nombre_rol FROM roles ORDER BY id ASC"
-    )
-    .fetch_all(&app_state.pool_pg)
-    .await {
+pub async fn get_roles(
+    req: actix_web::HttpRequest,
+    app_state: web::Data<AppState>,
+) -> impl Responder {
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
+    match sqlx::query_as::<_, (i32, String)>("SELECT id, nombre_rol FROM roles ORDER BY id ASC")
+        .fetch_all(&app_state.pool_pg)
+        .await
+    {
         Ok(roles) => HttpResponse::Ok().json(roles),
         Err(e) => {
             log::error!("Error al obtener roles: {}", e);
@@ -464,40 +453,41 @@ pub async fn crear_usuario(
     req: actix_web::HttpRequest,
     usuario: web::Json<UsuarioCreate>,
 ) -> impl Responder {
-    use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
-    
+    use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
+
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
     let nacionalidad = usuario.nacionalidad.trim().to_uppercase();
     let cedula = usuario.cedula;
-    
+
     if !(nacionalidad == "V" || nacionalidad == "E") {
         return HttpResponse::BadRequest().body("nacionalidad debe ser V o E");
     }
     if !validar_longitud_cedula(cedula) {
-    return HttpResponse::BadRequest().json(serde_json::json!({
-        "error": "Cédula inválida",
-        "codigo": "CEDULA_LONGITUD_INVALIDA",
-        "detalle": "Ingrese una cédula válida (6-8 dígitos)"
-    }));
-}
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Cédula inválida",
+            "codigo": "CEDULA_LONGITUD_INVALIDA",
+            "detalle": "Ingrese una cédula válida (6-8 dígitos)"
+        }));
+    }
     if cedula <= 0 || cedula > 99_999_999 {
         return HttpResponse::BadRequest().body("cedula inválida");
     }
 
-    // ✅ Después de obtener los datos de AC, validar si tiene objeción
-if let Ok(Some(ac_data)) = consultar_ac(&nacionalidad, cedula).await {
-    // Verificar si tiene objeción
-    if ac_data.status_objecion != Some(0) {
-        return HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "No se puede crear el usuario",
-            "codigo": "PRESENTA OBJECIÓN",
-            "detalle": "La cédula consultada presenta objeción en el AC"
-        }));
+    if let Ok(Some(ac_data)) = consultar_ac(&nacionalidad, cedula).await {
+        if ac_data.status_objecion != Some(0) {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "No se puede crear el usuario",
+                "codigo": "PRESENTA OBJECION",
+                "detalle": "La cédula consultada presenta objeción en el AC"
+            }));
+        }
     }
-}
-
 
     let usuario_existente = sqlx::query(
-        r#"SELECT id, eliminado FROM usuarios WHERE nacionalidad = $1 AND cedula = $2 LIMIT 1"#
+        r#"SELECT id, eliminado FROM usuarios WHERE nacionalidad = $1 AND cedula = $2 LIMIT 1"#,
     )
     .bind(&nacionalidad)
     .bind(cedula)
@@ -534,11 +524,11 @@ if let Ok(Some(ac_data)) = consultar_ac(&nacionalidad, cedula).await {
     let hashed_password = format!("{:x}", Sha256::digest(password_generada.as_bytes()));
 
     let user = match sqlx::query_as::<_, Usuario>(
-        "INSERT INTO usuarios (nacionalidad, cedula, primer_nombre, segundo_nombre, primer_apellido, 
+        "INSERT INTO usuarios (nacionalidad, cedula, primer_nombre, segundo_nombre, primer_apellido,
          segundo_apellido, username, password, activo, expira, id_rol, origen_creacion)
          VALUES ($1, $2, UPPER($3), UPPER($4), UPPER($5), UPPER($6), $7, $8, $9, $10, $11, 'MANUAL')
-         RETURNING id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre, 
-                   primer_apellido, segundo_apellido, username, password, activo, expira"
+         RETURNING id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre,
+                   primer_apellido, segundo_apellido, username, password, activo, expira",
     )
     .bind(&nacionalidad)
     .bind(cedula)
@@ -552,7 +542,8 @@ if let Ok(Some(ac_data)) = consultar_ac(&nacionalidad, cedula).await {
     .bind(usuario.expira)
     .bind(usuario.id_rol)
     .fetch_one(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(u) => u,
         Err(e) => {
             log::error!("Error al crear usuario: {}", e);
@@ -565,7 +556,7 @@ if let Ok(Some(ac_data)) = consultar_ac(&nacionalidad, cedula).await {
 
     let ip_origen = extract_ip(&req);
     let user_agent = extract_user_agent(&req);
-    let autor_id = obtener_id_usuario_del_token(&req, &app_state).await.ok();
+    let autor_id = obtener_id_usuario_del_token(&req).ok();
 
     let log_entry = LogEntry {
         id_tipo_accion: 2,
@@ -593,18 +584,23 @@ pub async fn reactivar_usuario(
     req: actix_web::HttpRequest,
     id: web::Path<i32>,
 ) -> impl Responder {
-    use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
-    
+    use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
+
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
     let user_id = id.into_inner();
 
     let existing_user = match sqlx::query_as::<_, Usuario>(
-        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre, 
+        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre,
          primer_apellido, segundo_apellido, username, password, activo, expira
-         FROM usuarios WHERE id = $1 AND eliminado = TRUE"
+         FROM usuarios WHERE id = $1 AND eliminado = TRUE",
     )
     .bind(user_id)
     .fetch_one(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(u) => u,
         Err(e) => {
             log::error!("Usuario no encontrado o no está eliminado: {}", e);
@@ -617,15 +613,16 @@ pub async fn reactivar_usuario(
     let usuario_cedula = existing_user.cedula;
 
     match sqlx::query(
-        r#"UPDATE usuarios SET eliminado = FALSE, eliminado_en = NULL, eliminado_por = NULL WHERE id = $1"#
+        r#"UPDATE usuarios SET eliminado = FALSE, eliminado_en = NULL, eliminado_por = NULL WHERE id = $1"#,
     )
     .bind(user_id)
     .execute(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(_) => {
             let ip_origen = extract_ip(&req);
             let user_agent = extract_user_agent(&req);
-            let autor_id = obtener_id_usuario_del_token(&req, &app_state).await.ok();
+            let autor_id = obtener_id_usuario_del_token(&req).ok();
 
             let log_entry = LogEntry {
                 id_tipo_accion: 2,
@@ -663,18 +660,23 @@ pub async fn actualizar_usuario(
     id: web::Path<i32>,
     usuario: web::Json<UsuarioUpdate>,
 ) -> impl Responder {
-    use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
-    
+    use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
+
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
     let user_id = id.into_inner();
 
     let existing_user = match sqlx::query_as::<_, Usuario>(
-        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre, 
+        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre,
          primer_apellido, segundo_apellido, username, password, activo, expira
-         FROM usuarios WHERE id = $1"
+         FROM usuarios WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(u) => u,
         Err(e) => {
             log::error!("Usuario no encontrado: {}", e);
@@ -690,9 +692,9 @@ pub async fn actualizar_usuario(
     };
 
     let updated_user = match sqlx::query_as::<_, Usuario>(
-        "UPDATE usuarios SET password = $1, activo = $2, expira = $3, id_rol = $4 
-         WHERE id = $5 RETURNING id, id_rol, nacionalidad, cedula, primer_nombre, 
-         segundo_nombre, primer_apellido, segundo_apellido, username, password, activo, expira"
+        "UPDATE usuarios SET password = $1, activo = $2, expira = $3, id_rol = $4
+         WHERE id = $5 RETURNING id, id_rol, nacionalidad, cedula, primer_nombre,
+         segundo_nombre, primer_apellido, segundo_apellido, username, password, activo, expira",
     )
     .bind(&password_to_use)
     .bind(usuario.activo)
@@ -700,7 +702,8 @@ pub async fn actualizar_usuario(
     .bind(usuario.id_rol)
     .bind(user_id)
     .fetch_one(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(u) => u,
         Err(e) => {
             log::error!("Error al actualizar usuario: {}", e);
@@ -713,7 +716,7 @@ pub async fn actualizar_usuario(
 
     let ip_origen = extract_ip(&req);
     let user_agent = extract_user_agent(&req);
-    let autor_id = obtener_id_usuario_del_token(&req, &app_state).await.ok();
+    let autor_id = obtener_id_usuario_del_token(&req).ok();
 
     let log_entry = LogEntry {
         id_tipo_accion: 2,
@@ -738,18 +741,23 @@ pub async fn bloquear_usuario(
     req: actix_web::HttpRequest,
     id: web::Path<i32>,
 ) -> impl Responder {
-    use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
-    
+    use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
+
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
     let user_id = id.into_inner();
 
     let existing_user = match sqlx::query_as::<_, Usuario>(
-        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre, 
+        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre,
          primer_apellido, segundo_apellido, username, password, activo, expira
-         FROM usuarios WHERE id = $1"
+         FROM usuarios WHERE id = $1",
     )
     .bind(user_id)
     .fetch_one(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(u) => u,
         Err(e) => {
             log::error!("Usuario no encontrado: {}", e);
@@ -768,17 +776,18 @@ pub async fn bloquear_usuario(
     };
 
     match sqlx::query_as::<_, Usuario>(
-        "UPDATE usuarios SET activo = NOT activo WHERE id = $1 
-         RETURNING id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre, 
-                   primer_apellido, segundo_apellido, username, password, activo, expira"
+        "UPDATE usuarios SET activo = NOT activo WHERE id = $1
+         RETURNING id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre,
+                   primer_apellido, segundo_apellido, username, password, activo, expira",
     )
     .bind(user_id)
     .fetch_one(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(user) => {
             let ip_origen = extract_ip(&req);
             let user_agent = extract_user_agent(&req);
-            let autor_id = obtener_id_usuario_del_token(&req, &app_state).await.ok();
+            let autor_id = obtener_id_usuario_del_token(&req).ok();
 
             let log_entry = LogEntry {
                 id_tipo_accion: 2,
@@ -812,18 +821,23 @@ pub async fn eliminar_usuario(
     req: actix_web::HttpRequest,
     id: web::Path<i32>,
 ) -> impl Responder {
-    use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
-    
+    use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
+
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
     let user_id = id.into_inner();
 
     let existing_user = match sqlx::query_as::<_, Usuario>(
-        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre, 
+        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre,
          primer_apellido, segundo_apellido, username, password, activo, expira
-         FROM usuarios WHERE id = $1 AND eliminado = FALSE"
+         FROM usuarios WHERE id = $1 AND eliminado = FALSE",
     )
     .bind(user_id)
     .fetch_one(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(u) => u,
         Err(e) => {
             log::error!("Usuario no encontrado o ya eliminado: {}", e);
@@ -834,16 +848,17 @@ pub async fn eliminar_usuario(
     };
 
     let usuario_cedula = existing_user.cedula;
-    let autor_id = obtener_id_usuario_del_token(&req, &app_state).await.ok();
+    let autor_id = obtener_id_usuario_del_token(&req).ok();
 
     match sqlx::query(
-        r#"UPDATE usuarios SET eliminado = TRUE, eliminado_en = CURRENT_TIMESTAMP, 
-           eliminado_por = $2 WHERE id = $1"#
+        r#"UPDATE usuarios SET eliminado = TRUE, eliminado_en = CURRENT_TIMESTAMP,
+           eliminado_por = $2 WHERE id = $1"#,
     )
     .bind(user_id)
     .bind(&autor_id)
     .execute(&app_state.pool_pg)
-    .await {
+    .await
+    {
         Ok(_) => {
             let ip_origen = extract_ip(&req);
             let user_agent = extract_user_agent(&req);
@@ -876,14 +891,18 @@ pub async fn eliminar_usuario(
 }
 
 // ============================================
-// ✅ VALIDAR CARGA MASIVA (PREVIEW)
+// VALIDAR CARGA MASIVA (PREVIEW)
 // ============================================
 
 pub async fn validar_carga_masiva(
     app_state: web::Data<AppState>,
-    _req: actix_web::HttpRequest,
+    req: actix_web::HttpRequest,
     mut payload: Multipart,
 ) -> impl Responder {
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
     let mut file_buffer = Vec::new();
     let mut file_name = String::from("unknown");
 
@@ -925,7 +944,7 @@ pub async fn validar_carga_masiva(
 }
 
 // ============================================
-// ✅ CONFIRMAR CARGA MASIVA (CON REACTIVACIÓN)
+// CONFIRMAR CARGA MASIVA (CON REACTIVACIÓN)
 // ============================================
 
 pub async fn confirmar_carga_masiva(
@@ -933,11 +952,15 @@ pub async fn confirmar_carga_masiva(
     req: actix_web::HttpRequest,
     body: web::Json<ConfirmarCargaRequest>,
 ) -> impl Responder {
-    use crate::modules::logging::{LogEntry, registrar_log, extract_ip, extract_user_agent};
-    
+    use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
+
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
     let ip_origen = extract_ip(&req);
     let user_agent = extract_user_agent(&req);
-    let autor_id = obtener_id_usuario_del_token(&req, &app_state).await.ok();
+    let autor_id = obtener_id_usuario_del_token(&req).ok();
 
     let carga_masiva_id: Option<i32> = if let Some(uid) = autor_id {
         match registrar_carga_masiva_log(
@@ -952,7 +975,9 @@ pub async fn confirmar_carga_masiva(
             "",
             &ip_origen,
             &user_agent,
-        ).await {
+        )
+        .await
+        {
             Ok(id) => Some(id),
             Err(e) => {
                 log::error!("Error creando log de carga masiva: {}", e);
@@ -974,41 +999,43 @@ pub async fn confirmar_carga_masiva(
         let password = generar_password(&fila.primer_nombre, &fila.primer_apellido, fila.cedula);
         let hashed_password = format!("{:x}", Sha256::digest(password.as_bytes()));
 
-    // ✅ NUEVO: Validar longitud de cédula (6-8 dígitos)
-    if !validar_longitud_cedula(fila.cedula) {
-        fallidos += 1;
-        detalles.push(format!("Fila {}: {}", fila.fila, "Ingrese una cédula válida (6-8 dígitos)"));
-        
-        if let Some(carga_id) = carga_masiva_id {
-            let _ = registrar_carga_masiva_detalle(
-                &app_state.pool_pg, 
-                carga_id, 
-                None, 
-                fila.cedula, 
-                &fila.nacionalidad,
-                &nombre_completo, 
-                Some(&username), 
-                "FALLIDO", 
-                Some("Cédula inválida: debe tener 6-8 dígitos"),
-            ).await;
+        if !validar_longitud_cedula(fila.cedula) {
+            fallidos += 1;
+            detalles.push(format!(
+                "Fila {}: {}",
+                fila.fila, "Ingrese una cédula válida (6-8 dígitos)"
+            ));
+
+            if let Some(carga_id) = carga_masiva_id {
+                let _ = registrar_carga_masiva_detalle(
+                    &app_state.pool_pg,
+                    carga_id,
+                    None,
+                    fila.cedula,
+                    &fila.nacionalidad,
+                    &nombre_completo,
+                    Some(&username),
+                    "FALLIDO",
+                    Some("Cédula inválida: debe tener 6-8 dígitos"),
+                )
+                .await;
+            }
+            continue;
         }
-        continue; // Saltar esta fila
-    }
-        
-// ✅ Dentro del procesamiento de cada fila en confirmar_carga_masiva
-if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
-    if ac_data.status_objecion != Some(0) {
-        fallidos += 1;
-        detalles.push(format!("Fila {}: Cédula {}-{} registra objeción en AC", 
-            fila.fila, fila.nacionalidad, fila.cedula));
-        continue; // Saltar esta fila
-    }
-}
 
+        if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
+            if ac_data.status_objecion != Some(0) {
+                fallidos += 1;
+                detalles.push(format!(
+                    "Fila {}: Cédula {}-{} registra objeción en AC",
+                    fila.fila, fila.nacionalidad, fila.cedula
+                ));
+                continue;
+            }
+        }
 
-        // ✅ 3. Verificar duplicado por CEDULA (incluyendo eliminados)
         let cedula_existente = sqlx::query(
-            "SELECT id, eliminado FROM usuarios WHERE nacionalidad = $1 AND cedula = $2"
+            "SELECT id, eliminado FROM usuarios WHERE nacionalidad = $1 AND cedula = $2",
         )
         .bind(&fila.nacionalidad)
         .bind(fila.cedula)
@@ -1019,15 +1046,15 @@ if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
             Ok(Some(row)) => {
                 let eliminado: bool = row.get("eliminado");
                 let usuario_id: i32 = row.get("id");
-                
+
                 if eliminado {
                     match sqlx::query(
-                        r#"UPDATE usuarios SET 
+                        r#"UPDATE usuarios SET
                            eliminado = FALSE, eliminado_en = NULL, eliminado_por = NULL,
                            nacionalidad = $1, cedula = $2, primer_nombre = $3, segundo_nombre = $4,
                            primer_apellido = $5, segundo_apellido = $6, password = $7,
                            activo = TRUE, expira = FALSE, id_rol = $8, username = $9
-                           WHERE id = $10"#
+                           WHERE id = $10"#,
                     )
                     .bind(&fila.nacionalidad)
                     .bind(fila.cedula)
@@ -1040,20 +1067,31 @@ if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
                     .bind(&username)
                     .bind(usuario_id)
                     .execute(&app_state.pool_pg)
-                    .await {
+                    .await
+                    {
                         Ok(_) => {
                             exitosos += 1;
                             reactivados += 1;
-                            detalles.push(format!("Fila {}: Usuario {} {} REACTIVADO por cédula (usuario: {})", 
-                                fila.fila, fila.primer_nombre, fila.primer_apellido, username));
-                            
+                            detalles.push(format!(
+                                "Fila {}: Usuario {} {} REACTIVADO por cédula (usuario: {})",
+                                fila.fila, fila.primer_nombre, fila.primer_apellido, username
+                            ));
+
                             if let Some(carga_id) = carga_masiva_id {
                                 let _ = registrar_carga_masiva_detalle(
-                                    &app_state.pool_pg, carga_id, Some(usuario_id), fila.cedula, &fila.nacionalidad,
-                                    &nombre_completo, Some(&username), "REACTIVADO", None,
-                                ).await;
+                                    &app_state.pool_pg,
+                                    carga_id,
+                                    Some(usuario_id),
+                                    fila.cedula,
+                                    &fila.nacionalidad,
+                                    &nombre_completo,
+                                    Some(&username),
+                                    "REACTIVADO",
+                                    None,
+                                )
+                                .await;
                             }
-                            
+
                             let log_entry = LogEntry {
                                 id_tipo_accion: 2,
                                 id_accion: 13,
@@ -1070,18 +1108,32 @@ if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
                         }
                         Err(e) => {
                             fallidos += 1;
-                            detalles.push(format!("Fila {}: Error reactivando usuario por cédula: {}", fila.fila, e));
+                            detalles.push(format!(
+                                "Fila {}: Error reactivando usuario por cédula: {}",
+                                fila.fila, e
+                            ));
                         }
                     }
                     continue;
                 } else {
                     fallidos += 1;
-                    detalles.push(format!("Fila {}: Cédula {}-{} ya existe (usuario activo)", fila.fila, fila.nacionalidad, fila.cedula));
+                    detalles.push(format!(
+                        "Fila {}: Cédula {}-{} ya existe (usuario activo)",
+                        fila.fila, fila.nacionalidad, fila.cedula
+                    ));
                     if let Some(carga_id) = carga_masiva_id {
                         let _ = registrar_carga_masiva_detalle(
-                            &app_state.pool_pg, carga_id, None, fila.cedula, &fila.nacionalidad,
-                            &nombre_completo, Some(&username), "FALLIDO", Some("Cédula duplicada (activa)"),
-                        ).await;
+                            &app_state.pool_pg,
+                            carga_id,
+                            None,
+                            fila.cedula,
+                            &fila.nacionalidad,
+                            &nombre_completo,
+                            Some(&username),
+                            "FALLIDO",
+                            Some("Cédula duplicada (activa)"),
+                        )
+                        .await;
                     }
                     continue;
                 }
@@ -1094,12 +1146,11 @@ if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
             }
         }
 
-        // ✅ 4. Crear usuario nuevo
         let insert_result = sqlx::query(
-            r#"INSERT INTO usuarios (nacionalidad, cedula, primer_nombre, segundo_nombre, 
+            r#"INSERT INTO usuarios (nacionalidad, cedula, primer_nombre, segundo_nombre,
                primer_apellido, segundo_apellido, username, password, activo, expira, id_rol, origen_creacion)
                VALUES ($1, $2, UPPER($3), UPPER($4), UPPER($5), UPPER($6), $7, $8, $9, $10, $11, 'CARGA_MASIVA')
-               RETURNING id"#
+               RETURNING id"#,
         )
         .bind(&fila.nacionalidad)
         .bind(fila.cedula)
@@ -1119,13 +1170,23 @@ if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
             Ok(Some(row)) => {
                 let usuario_id: i32 = row.get(0);
                 exitosos += 1;
-                detalles.push(format!("Fila {}: Usuario {} {} creado (username: {})", 
-                    fila.fila, fila.primer_nombre, fila.primer_apellido, username));
+                detalles.push(format!(
+                    "Fila {}: Usuario {} {} creado (username: {})",
+                    fila.fila, fila.primer_nombre, fila.primer_apellido, username
+                ));
                 if let Some(carga_id) = carga_masiva_id {
                     let _ = registrar_carga_masiva_detalle(
-                        &app_state.pool_pg, carga_id, Some(usuario_id), fila.cedula, &fila.nacionalidad,
-                        &nombre_completo, Some(&username), "EXITOSO", None,
-                    ).await;
+                        &app_state.pool_pg,
+                        carga_id,
+                        Some(usuario_id),
+                        fila.cedula,
+                        &fila.nacionalidad,
+                        &nombre_completo,
+                        Some(&username),
+                        "EXITOSO",
+                        None,
+                    )
+                    .await;
                 }
             }
             Ok(None) => {
@@ -1142,7 +1203,7 @@ if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
     if let Some(carga_id) = carga_masiva_id {
         let detalles_json = serde_json::to_string(&detalles).unwrap_or_default();
         let _ = sqlx::query(
-            r#"UPDATE carga_masiva_logs SET total_filas = $1, exitosos = $2, fallidos = $3, detalles = $4 WHERE id = $5"#
+            r#"UPDATE carga_masiva_logs SET total_filas = $1, exitosos = $2, fallidos = $3, detalles = $4 WHERE id = $5"#,
         )
         .bind(&((exitosos + fallidos) as i32))
         .bind(&(exitosos as i32))
@@ -1153,13 +1214,12 @@ if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
         .await;
     }
 
-    // ✅ AHORA (id_accion = 7 que SÍ existe en acciones)
-      let log_entry = LogEntry {
+    let log_entry = LogEntry {
         id_tipo_accion: 2,
-        id_accion: 7,  // ← 7 = "CARGA MASIVA DE USUARIOS" en tabla acciones
+        id_accion: 7,
         id_usuario: autor_id,
         accion: "CARGA MASIVA DE USUARIOS".to_string(),
-        cedula_relacionada: carga_masiva_id,  // ← AQUÍ VA EL carga_masiva_id (14, 15, 16...)
+        cedula_relacionada: carga_masiva_id,
         ip_origen: ip_origen.clone(),
         user_agent: user_agent.clone(),
     };
@@ -1179,19 +1239,27 @@ if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
 }
 
 // ============================================
-// ✅ FUNCIONES DE VALIDACIÓN PREVIEW
+// FUNCIONES DE VALIDACIÓN PREVIEW
 // ============================================
 
-async fn validar_csv_preview(buffer: &[u8], app_state: web::Data<AppState>) -> Result<CargaMasivaPreview, String> {
-    let mut reader = ReaderBuilder::new().has_headers(true).from_reader(Cursor::new(buffer));
+async fn validar_csv_preview(
+    buffer: &[u8],
+    app_state: web::Data<AppState>,
+) -> Result<CargaMasivaPreview, String> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(Cursor::new(buffer));
     let mut filas = Vec::new();
     let mut row_idx = 0;
 
     for result in reader.records() {
         row_idx += 1;
-        if row_idx == 1 { continue; }
+        if row_idx == 1 {
+            continue;
+        }
 
-        let record = result.map_err(|e| format!("Error leyendo CSV línea {}: {}", row_idx, e))?;
+        let record =
+            result.map_err(|e| format!("Error leyendo CSV línea {}: {}", row_idx, e))?;
         if record.len() < 6 {
             filas.push(FilaPreview {
                 fila: row_idx,
@@ -1207,7 +1275,7 @@ async fn validar_csv_preview(buffer: &[u8], app_state: web::Data<AppState>) -> R
                 ac_primer_apellido: None,
                 ac_segundo_apellido: None,
                 discrepancias: vec![],
-                mensaje_error: Some(format!("Columnas insuficientes (se esperan 6)")),
+                mensaje_error: Some("Columnas insuficientes (se esperan 6)".to_string()),
             });
             continue;
         }
@@ -1228,7 +1296,8 @@ async fn validar_csv_preview(buffer: &[u8], app_state: web::Data<AppState>) -> R
             segundo_nombre,
             primer_apellido,
             segundo_apellido,
-        ).await;
+        )
+        .await;
 
         filas.push(fila_preview);
     }
@@ -1236,35 +1305,50 @@ async fn validar_csv_preview(buffer: &[u8], app_state: web::Data<AppState>) -> R
     Ok(calcular_resumen_preview(filas))
 }
 
-async fn validar_xlsx_preview(buffer: &[u8], app_state: web::Data<AppState>) -> Result<CargaMasivaPreview, String> {
+async fn validar_xlsx_preview(
+    buffer: &[u8],
+    app_state: web::Data<AppState>,
+) -> Result<CargaMasivaPreview, String> {
     let cursor = Cursor::new(buffer.to_vec());
     let mut workbook = Xlsx::new(cursor).map_err(|e| format!("Error abriendo XLSX: {}", e))?;
     let sheet_names = workbook.sheet_names();
     if sheet_names.is_empty() {
         return Err("No se encontraron hojas en el archivo XLSX".to_string());
     }
-    let range = workbook.worksheet_range(&sheet_names[0]).map_err(|e| format!("Error leyendo hoja: {}", e))?;
+    let range = workbook
+        .worksheet_range(&sheet_names[0])
+        .map_err(|e| format!("Error leyendo hoja: {}", e))?;
     validar_range_preview(range, app_state).await
 }
 
-async fn validar_xls_preview(buffer: &[u8], app_state: web::Data<AppState>) -> Result<CargaMasivaPreview, String> {
+async fn validar_xls_preview(
+    buffer: &[u8],
+    app_state: web::Data<AppState>,
+) -> Result<CargaMasivaPreview, String> {
     let cursor = Cursor::new(buffer.to_vec());
     let mut workbook = Xls::new(cursor).map_err(|e| format!("Error abriendo XLS: {}", e))?;
     let sheet_names = workbook.sheet_names();
     if sheet_names.is_empty() {
         return Err("No se encontraron hojas en el archivo XLS".to_string());
     }
-    let range = workbook.worksheet_range(&sheet_names[0]).map_err(|e| format!("Error leyendo hoja: {}", e))?;
+    let range = workbook
+        .worksheet_range(&sheet_names[0])
+        .map_err(|e| format!("Error leyendo hoja: {}", e))?;
     validar_range_preview(range, app_state).await
 }
 
-async fn validar_range_preview(range: calamine::Range<CalamineDataType>, app_state: web::Data<AppState>) -> Result<CargaMasivaPreview, String> {
+async fn validar_range_preview(
+    range: calamine::Range<CalamineDataType>,
+    app_state: web::Data<AppState>,
+) -> Result<CargaMasivaPreview, String> {
     let mut filas = Vec::new();
     let mut row_idx = 0;
 
     for row in range.rows() {
         row_idx += 1;
-        if row_idx == 1 { continue; }
+        if row_idx == 1 {
+            continue;
+        }
         if row.len() < 6 {
             filas.push(FilaPreview {
                 fila: row_idx,
@@ -1280,7 +1364,7 @@ async fn validar_range_preview(range: calamine::Range<CalamineDataType>, app_sta
                 ac_primer_apellido: None,
                 ac_segundo_apellido: None,
                 discrepancias: vec![],
-                mensaje_error: Some(format!("Columnas insuficientes (se esperan 6)")),
+                mensaje_error: Some("Columnas insuficientes (se esperan 6)".to_string()),
             });
             continue;
         }
@@ -1325,7 +1409,8 @@ async fn validar_range_preview(range: calamine::Range<CalamineDataType>, app_sta
             segundo_nombre,
             primer_apellido,
             segundo_apellido,
-        ).await;
+        )
+        .await;
 
         filas.push(fila_preview);
     }
@@ -1343,7 +1428,11 @@ async fn procesar_fila_preview(
     excel_primer_apellido: String,
     excel_segundo_apellido: String,
 ) -> FilaPreview {
-    if nacionalidad.is_empty() || cedula == 0 || excel_primer_nombre.is_empty() || excel_primer_apellido.is_empty() {
+    if nacionalidad.is_empty()
+        || cedula == 0
+        || excel_primer_nombre.is_empty()
+        || excel_primer_apellido.is_empty()
+    {
         return FilaPreview {
             fila,
             nacionalidad,
@@ -1402,23 +1491,25 @@ async fn procesar_fila_preview(
 
     match consultar_ac(&nacionalidad, cedula).await {
         Ok(Some(ac_data)) => {
-if ac_data.status_objecion != Some(0) {
-            return FilaPreview {
-                fila,
-                nacionalidad,
-                cedula,
-                estado: "RECHAZADO".to_string(),
-                excel_primer_nombre,
-                excel_segundo_nombre,
-                excel_primer_apellido,
-                excel_segundo_apellido,
-                ac_primer_nombre: Some(ac_data.primer_nombre.clone()),
-                ac_segundo_nombre: Some(ac_data.segundo_nombre.clone()),
-                ac_primer_apellido: Some(ac_data.primer_apellido.clone()),
-                ac_segundo_apellido: Some(ac_data.segundo_apellido.clone()),
-                discrepancias: vec![],
-                mensaje_error: Some("⚠️ La cédula registra presenta objeción en el AC".to_string()),
-            };
+            if ac_data.status_objecion != Some(0) {
+                return FilaPreview {
+                    fila,
+                    nacionalidad,
+                    cedula,
+                    estado: "RECHAZADO".to_string(),
+                    excel_primer_nombre,
+                    excel_segundo_nombre,
+                    excel_primer_apellido,
+                    excel_segundo_apellido,
+                    ac_primer_nombre: Some(ac_data.primer_nombre.clone()),
+                    ac_segundo_nombre: Some(ac_data.segundo_nombre.clone()),
+                    ac_primer_apellido: Some(ac_data.primer_apellido.clone()),
+                    ac_segundo_apellido: Some(ac_data.segundo_apellido.clone()),
+                    discrepancias: vec![],
+                    mensaje_error: Some(
+                        "⚠️ La cédula registra presenta objeción en el AC".to_string(),
+                    ),
+                };
             }
 
             let mut fila_preview = FilaPreview {
@@ -1439,7 +1530,7 @@ if ac_data.status_objecion != Some(0) {
             };
 
             let discrepancias = comparar_datos(&fila_preview, &ac_data);
-            
+
             if !discrepancias.is_empty() {
                 fila_preview.estado = "DISCREPANCIA".to_string();
                 fila_preview.discrepancias = discrepancias;
@@ -1498,10 +1589,16 @@ fn calcular_resumen_preview(filas: Vec<FilaPreview>) -> CargaMasivaPreview {
 }
 
 // ============================================
-// ✅ DESCARGAR PLANTILLA
+// DESCARGAR PLANTILLA
 // ============================================
 
-pub async fn descargar_plantilla() -> Result<HttpResponse, Error> {
+pub async fn descargar_plantilla(
+    req: actix_web::HttpRequest,
+) -> Result<HttpResponse, Error> {
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return Ok(res);
+    }
+
     info!("📥 Sirviendo plantilla Excel");
     let file_path = PathBuf::from("files/templates/plantilla.xlsx");
     if !file_path.exists() {
@@ -1509,37 +1606,43 @@ pub async fn descargar_plantilla() -> Result<HttpResponse, Error> {
             error: "Plantilla no encontrada en el servidor".to_string(),
         }));
     }
-    let file_bytes = std::fs::read(&file_path).map_err(|e| {
-        actix_web::error::ErrorInternalServerError(e)
-    })?;
+    let file_bytes = std::fs::read(&file_path)
+        .map_err(actix_web::error::ErrorInternalServerError)?;
     info!("✅ Plantilla enviada: {} bytes", file_bytes.len());
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        .insert_header(("Content-Disposition", "attachment; filename=\"plantilla_usuarios.xlsx\""))
+        .insert_header((
+            "Content-Disposition",
+            "attachment; filename=\"plantilla_usuarios.xlsx\"",
+        ))
         .body(file_bytes))
 }
 
 // ============================================
-// ✅ DESCARGAR EXCEL DE CARGA MASIVA
+// DESCARGAR EXCEL DE CARGA MASIVA
 // ============================================
 
 pub async fn descargar_carga_masiva_excel(
+    req: actix_web::HttpRequest,
     app_state: web::Data<AppState>,
     path: web::Path<i32>,
 ) -> impl Responder {
+    if let Err(res) = require_admin_or_sistemas(&req) {
+        return res;
+    }
+
     let carga_masiva_id = path.into_inner();
 
     log::info!("📥 Descargando Excel para carga_masiva_id: {}", carga_masiva_id);
 
-    // ✅ 1. Obtener detalles de la carga masiva
     let detalles = match sqlx::query_as::<_, CargaMasivaDetalle>(
         r#"
-        SELECT id, carga_masiva_id, usuario_id, cedula, nacionalidad, 
+        SELECT id, carga_masiva_id, usuario_id, cedula, nacionalidad,
                nombre_completo, username, estado, error_detalle, created_at
         FROM carga_masiva_detalles
         WHERE carga_masiva_id = $1
         ORDER BY id ASC
-        "#
+        "#,
     )
     .bind(carga_masiva_id)
     .fetch_all(&app_state.pool_pg)
@@ -1556,21 +1659,35 @@ pub async fn descargar_carga_masiva_excel(
     };
 
     log::info!("📊 Detalles encontrados: {} registros", detalles.len());
-    log::info!("📊 Exitosos: {}", detalles.iter().filter(|d| d.estado == "EXITOSO" || d.estado == "REACTIVADO").count());
-    log::info!("📊 Fallidos: {}", detalles.iter().filter(|d| d.estado == "FALLIDO" || d.estado == "INVALIDO" || d.estado == "RECHAZADO").count());
+    log::info!(
+        "📊 Exitosos: {}",
+        detalles
+            .iter()
+            .filter(|d| d.estado == "EXITOSO" || d.estado == "REACTIVADO")
+            .count()
+    );
+    log::info!(
+        "📊 Fallidos: {}",
+        detalles
+            .iter()
+            .filter(|d| d.estado == "FALLIDO" || d.estado == "INVALIDO" || d.estado == "RECHAZADO")
+            .count()
+    );
 
     if detalles.is_empty() {
-        log::warn!("⚠️ No se encontraron detalles para carga_masiva_id: {}", carga_masiva_id);
+        log::warn!(
+            "⚠️ No se encontraron detalles para carga_masiva_id: {}",
+            carga_masiva_id
+        );
         return HttpResponse::NotFound().json(serde_json::json!({
             "error": format!("No se encontraron detalles para carga_masiva_id {}", carga_masiva_id)
         }));
     }
 
-    // ✅ 2. Generar Excel con rust_xlsxwriter
-    use rust_xlsxwriter::{Workbook, Format, FormatAlign, FormatBorder};
+    use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook};
 
     let mut workbook = Workbook::new();
-    
+
     let header_format = Format::new()
         .set_bold()
         .set_align(FormatAlign::Center)
@@ -1579,48 +1696,86 @@ pub async fn descargar_carga_masiva_excel(
 
     let normal_format = Format::new();
 
-    // Hoja 1: Exitosos
     let sheet = workbook.add_worksheet().set_name("Exitosos").unwrap();
-    
+
     let headers = ["Nacionalidad", "Cédula", "Nombre Completo", "Username", "Estado"];
     for (col, header) in headers.iter().enumerate() {
-        sheet.write_string_with_format(0, col as u16, *header, &header_format).unwrap();
+        sheet
+            .write_string_with_format(0, col as u16, *header, &header_format)
+            .unwrap();
     }
 
     let mut row = 1;
     for detalle in &detalles {
         if detalle.estado == "EXITOSO" || detalle.estado == "REACTIVADO" {
-            sheet.write_string_with_format(row, 0, &detalle.nacionalidad, &normal_format).unwrap();
-            sheet.write_number_with_format(row, 1, detalle.cedula as f64, &normal_format).unwrap();
-            sheet.write_string_with_format(row, 2, &detalle.nombre_completo, &normal_format).unwrap();
-            sheet.write_string_with_format(row, 3, detalle.username.as_deref().unwrap_or(""), &normal_format).unwrap();
-            sheet.write_string_with_format(row, 4, &detalle.estado, &normal_format).unwrap();
+            sheet
+                .write_string_with_format(row, 0, &detalle.nacionalidad, &normal_format)
+                .unwrap();
+            sheet
+                .write_number_with_format(row, 1, detalle.cedula as f64, &normal_format)
+                .unwrap();
+            sheet
+                .write_string_with_format(row, 2, &detalle.nombre_completo, &normal_format)
+                .unwrap();
+            sheet
+                .write_string_with_format(
+                    row,
+                    3,
+                    detalle.username.as_deref().unwrap_or(""),
+                    &normal_format,
+                )
+                .unwrap();
+            sheet
+                .write_string_with_format(row, 4, &detalle.estado, &normal_format)
+                .unwrap();
             row += 1;
         }
     }
 
-    // Hoja 2: Fallidos
     let sheet = workbook.add_worksheet().set_name("Fallidos").unwrap();
-    
+
     let headers = ["Nacionalidad", "Cédula", "Nombre Completo", "Username", "Estado", "Error"];
     for (col, header) in headers.iter().enumerate() {
-        sheet.write_string_with_format(0, col as u16, *header, &header_format).unwrap();
+        sheet
+            .write_string_with_format(0, col as u16, *header, &header_format)
+            .unwrap();
     }
 
     let mut row = 1;
     for detalle in &detalles {
         if detalle.estado == "FALLIDO" || detalle.estado == "INVALIDO" || detalle.estado == "RECHAZADO" {
-            sheet.write_string_with_format(row, 0, &detalle.nacionalidad, &normal_format).unwrap();
-            sheet.write_number_with_format(row, 1, detalle.cedula as f64, &normal_format).unwrap();
-            sheet.write_string_with_format(row, 2, &detalle.nombre_completo, &normal_format).unwrap();
-            sheet.write_string_with_format(row, 3, detalle.username.as_deref().unwrap_or(""), &normal_format).unwrap();
-            sheet.write_string_with_format(row, 4, &detalle.estado, &normal_format).unwrap();
-            sheet.write_string_with_format(row, 5, detalle.error_detalle.as_deref().unwrap_or(""), &normal_format).unwrap();
+            sheet
+                .write_string_with_format(row, 0, &detalle.nacionalidad, &normal_format)
+                .unwrap();
+            sheet
+                .write_number_with_format(row, 1, detalle.cedula as f64, &normal_format)
+                .unwrap();
+            sheet
+                .write_string_with_format(row, 2, &detalle.nombre_completo, &normal_format)
+                .unwrap();
+            sheet
+                .write_string_with_format(
+                    row,
+                    3,
+                    detalle.username.as_deref().unwrap_or(""),
+                    &normal_format,
+                )
+                .unwrap();
+            sheet
+                .write_string_with_format(row, 4, &detalle.estado, &normal_format)
+                .unwrap();
+            sheet
+                .write_string_with_format(
+                    row,
+                    5,
+                    detalle.error_detalle.as_deref().unwrap_or(""),
+                    &normal_format,
+                )
+                .unwrap();
             row += 1;
         }
     }
 
-    // ✅ 3. Guardar en buffer
     let buffer = match workbook.save_to_buffer() {
         Ok(buf) => buf,
         Err(e) => {
@@ -1632,15 +1787,19 @@ pub async fn descargar_carga_masiva_excel(
         }
     };
 
-    // ✅ 4. Retornar archivo
-    let nombre_archivo = format!("carga_masiva_{}_{}.xlsx", carga_masiva_id, chrono::Local::now().format("%Y%m%d_%H%M%S"));
+    let nombre_archivo = format!(
+        "carga_masiva_{}_{}.xlsx",
+        carga_masiva_id,
+        chrono::Local::now().format("%Y%m%d_%H%M%S")
+    );
 
     log::info!("✅ Excel generado: {}", nombre_archivo);
 
     HttpResponse::Ok()
         .content_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        .insert_header(("Content-Disposition", format!("attachment; filename=\"{}\"", nombre_archivo)))
+        .insert_header((
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", nombre_archivo),
+        ))
         .body(buffer)
 }
-
-// cambios en el AC: si status_objecion != 0 entonces RECHAZADO con mensaje de objeción

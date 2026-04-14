@@ -1,10 +1,14 @@
-use actix_web::{web, HttpResponse, Error, HttpRequest};
+use actix_web::{web, Error, HttpRequest, HttpResponse};
 use oracle::{Connection, Row, RowValue};
 use serde::Deserialize;
 use std::env;
 use std::time::Instant;
-use crate::structs::AppState;
+
+use crate::middleware::auth::{
+    get_current_user_id, is_operador, require_consulta_basica, require_consulta_completa,
+};
 use crate::modules::logging::LogEntry;
+use crate::structs::AppState;
 
 // =====================
 // Helper Functions para Logging
@@ -46,59 +50,9 @@ fn log_votos_emitir_entry(usuario_id: i32, cedula_elector: i32, ip: String, ua: 
     }
 }
 
-// =====================
-// Helper para obtener id_usuario del token
-// =====================
-
-async fn obtener_id_usuario_del_token(
-    req: &HttpRequest,
-    app_state: &web::Data<AppState>,
-) -> Result<i32, String> {
-    use jsonwebtoken::{decode, DecodingKey, Validation};
-
-    #[derive(Debug, Deserialize)]
-    #[allow(dead_code)]
-    struct Claims {
-        sub: String,
-        exp: usize,
-        iat: usize,
-    }
-
-    let token = req
-        .headers()
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .unwrap_or("");
-
-    if token.is_empty() {
-        log::warn!("⚠️ Token NO presente en request");
-        return Err("Token no encontrado".to_string());
-    }
-
-    log::info!("🔑 Token presente para usuario");
-
-    match decode::<Claims>(
-        token,
-        &DecodingKey::from_secret(app_state.jwt_secret.as_bytes()),
-        &Validation::default()
-    ) {
-        Ok(token_data) => {
-            let user_id = token_data.claims.sub.parse::<i32>()
-                .map_err(|_| "ID inválido en token")?;
-            log::info!("✅ Token decodificado exitosamente - User ID: {}", user_id);
-            Ok(user_id)
-        }
-        Err(e) => {
-            log::error!("❌ Error decodificando token: {}", e);
-            Err("Token inválido".to_string())
-        }
-    }
+fn get_autor_id(req: &HttpRequest) -> Option<i32> {
+    get_current_user_id(req).ok()
 }
-
-// =====================
-// Movimiento RE
-// =====================
 
 #[derive(serde::Serialize)]
 struct MovimientoRE {
@@ -133,7 +87,10 @@ fn oracle_conn() -> Result<Connection, oracle::Error> {
     Connection::connect(username, password, connect_string)
 }
 
-// ✅ MOVIMIENTOS RE CON LOGGING
+// =====================
+// Movimiento RE
+// =====================
+
 pub async fn get_movimientos_re(
     path: web::Path<(String, String)>,
     req: HttpRequest,
@@ -141,18 +98,24 @@ pub async fn get_movimientos_re(
 ) -> Result<HttpResponse, Error> {
     use crate::modules::logging::registrar_log;
 
+    if let Err(res) = require_consulta_basica(&req) {
+        return Ok(res);
+    }
+
     let (nacionalidad, cedula_str) = path.into_inner();
     let nacionalidad = nacionalidad.to_uppercase();
-    let cedula_int: i32 = cedula_str.parse()
+    let cedula_int: i32 = cedula_str
+        .parse()
         .map_err(|_| actix_web::error::ErrorBadRequest("Cédula inválida"))?;
 
-    log::info!("🔍 Movimientos RE - Cédula: {} {}", nacionalidad, cedula_int);
+    if !(nacionalidad == "V" || nacionalidad == "E") {
+        return Err(actix_web::error::ErrorBadRequest("nacionalidad inválida"));
+    }
 
-    let conn = oracle_conn()
-        .map_err(|e| {
-            log::error!("❌ Error conectando a Oracle: {}", e);
-            actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e))
-        })?;
+    let conn = oracle_conn().map_err(|e| {
+        log::error!("❌ Error conectando a Oracle: {}", e);
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
+    })?;
 
     let sql = "SELECT
         t.CIERRE, c.NOMBRE_CORTO, t.ID_LOTE, tm.DESCRIPCION DESCRIPCION_MOVIMIENTO,
@@ -168,25 +131,23 @@ pub async fn get_movimientos_re(
         And T.Cedula_Number= :cedula
         order by cierre desc";
 
-    let rows = conn.query_as::<MovimientoRE>(sql, &[&nacionalidad, &cedula_str])
+    let rows = conn
+        .query_as::<MovimientoRE>(sql, &[&nacionalidad, &cedula_str])
         .map_err(|e| {
             log::error!("❌ Error ejecutando query: {}", e);
-            actix_web::error::ErrorInternalServerError(format!("Error ejecutando query: {}", e))
+            actix_web::error::ErrorInternalServerError("Error interno del servidor")
         })?;
 
     let mut re_array: Vec<MovimientoRE> = Vec::new();
     for row_result in rows {
-        let mov = row_result
-            .map_err(|e| {
-                log::error!("❌ Error procesando fila: {}", e);
-                actix_web::error::ErrorInternalServerError(format!("Error procesando fila: {}", e))
-            })?;
+        let mov = row_result.map_err(|e| {
+            log::error!("❌ Error procesando fila: {}", e);
+            actix_web::error::ErrorInternalServerError("Error interno del servidor")
+        })?;
         re_array.push(mov);
     }
 
-    log::info!("✅ Movimientos RE encontrados: {}", re_array.len());
-
-    if let Ok(autor_id) = obtener_id_usuario_del_token(&req, &app_state).await {
+    if let Some(autor_id) = get_autor_id(&req) {
         let ip_origen = crate::modules::logging::extract_ip(&req);
         let user_agent = crate::modules::logging::extract_user_agent(&req);
         let log_entry = log_movimientos_re_entry(autor_id, cedula_int, ip_origen, user_agent);
@@ -200,7 +161,7 @@ pub async fn get_movimientos_re(
 }
 
 // =====================
-// Elector (para tu Dialog) CON LOGGING
+// Elector
 // =====================
 
 #[derive(Deserialize)]
@@ -221,7 +182,6 @@ pub struct ElectorResponse {
     pub codigo_objecion: Option<String>,
     pub descripcion_objecion: Option<String>,
     pub direccion_elector: Option<String>,
-    // ÚLTIMO EVENTO
     pub fecha_ultimo_evento: Option<String>,
     pub edad_ultimo_evento: Option<i64>,
     pub numero_mesa: Option<i64>,
@@ -233,14 +193,12 @@ pub struct ElectorResponse {
     pub parroquia: Option<String>,
     pub nombre_centro: Option<String>,
     pub direccion_centro: Option<String>,
-    // CENTRO ACTUAL
     pub estado_actual: Option<String>,
     pub municipio_actual: Option<String>,
     pub parroquia_actual: Option<String>,
     pub codigo_centro_actual: Option<String>,
     pub nombre_centro_actual: Option<String>,
     pub direccion_centro_actual: Option<String>,
-    // MIEMBRO DE MESA
     pub miembro_mesa_numero_mesa: Option<i64>,
     pub miembro_mesa_cargo: Option<String>,
     pub miembro_mesa_centro_capacitacion: Option<String>,
@@ -252,7 +210,9 @@ pub struct ElectorResponse {
 }
 
 fn yyyymmdd_to_iso(s: &str) -> Option<String> {
-    if s.len() < 8 { return None; }
+    if s.len() < 8 {
+        return None;
+    }
     Some(format!("{}-{}-{}", &s[0..4], &s[4..6], &s[6..8]))
 }
 
@@ -262,9 +222,13 @@ fn pad9(n: i64) -> String {
 
 fn normalize_codigo_centro_9<S: AsRef<str>>(s: S) -> Option<String> {
     let trimmed = s.as_ref().trim();
-    if trimmed.is_empty() { return None; }
+    if trimmed.is_empty() {
+        return None;
+    }
     let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() { return None; }
+    if digits.is_empty() {
+        return None;
+    }
     let value = digits.parse::<i64>().ok()?;
     Some(format!("{:09}", value))
 }
@@ -273,9 +237,8 @@ fn clean_geo_desc(s: String) -> String {
     let mut t = s.trim().to_string();
     let upper = t.to_uppercase();
     let prefixes = [
-        "EDO.", "EDO", "ESTADO",
-        "MP.", "MP", "MUN.", "MUN", "MUNICIPIO",
-        "PQ.", "PQ", "PAR.", "PAR", "PARROQUIA",
+        "EDO.", "EDO", "ESTADO", "MP.", "MP", "MUN.", "MUN", "MUNICIPIO", "PQ.", "PQ", "PAR.",
+        "PAR", "PARROQUIA",
     ];
     for p in prefixes.iter() {
         if upper.starts_with(p) {
@@ -334,7 +297,9 @@ fn fmt_geo_sigla(prefix: &str, desc: Option<String>) -> String {
 }
 
 fn ddmmyyyy(s: &str) -> Option<String> {
-    if s.len() < 8 { return None; }
+    if s.len() < 8 {
+        return None;
+    }
     Some(format!("{}-{}-{}", &s[0..2], &s[2..4], &s[4..8]))
 }
 
@@ -368,20 +333,27 @@ fn set_no_aplica_miembro(resp: &mut ElectorResponse) {
     resp.miembro_mesa_direccion_centro_capacitacion = Some("No aplica".to_string());
 }
 
-// ✅ GET ELECTOR CON LOGGING
+fn aplicar_filtro_operador(resp: &mut ElectorResponse) {
+    resp.direccion_elector = None;
+}
+
 pub async fn get_elector(
     query: web::Query<ElectorQuery>,
     req: HttpRequest,
     app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
-    use crate::modules::logging::registrar_log;
+
+
+    if let Err(res) = require_consulta_basica(&req) {
+        return Ok(res);
+    }
+
+    let operador = is_operador(&req);
 
     let nac = query.nacionalidad.trim().to_uppercase();
     let nacionalidad = nac.chars().next().unwrap_or('V').to_string();
     let cedula = query.cedula;
     let cedula_int = cedula as i32;
-
-    log::info!("🔍 Consultar Datos Elector - Cédula: {} {}", nacionalidad, cedula);
 
     if !(nacionalidad == "V" || nacionalidad == "E") {
         return Err(actix_web::error::ErrorBadRequest("nac debe ser V o E"));
@@ -392,7 +364,7 @@ pub async fn get_elector(
 
     let conn = oracle_conn().map_err(|e| {
         log::error!("❌ Error conectando a Oracle: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     let mut resp = ElectorResponse {
@@ -401,9 +373,6 @@ pub async fn get_elector(
         ..Default::default()
     };
 
-    // =====================
-    // DATOS PERSONALES
-    // =====================
     let sql_persona = r#"
         SELECT AC.PRIMER_APELLIDO, AC.SEGUNDO_APELLIDO, AC.PRIMER_NOMBRE, AC.SEGUNDO_NOMBRE,
         AC.FECHA_NACIMIENTO_4, AC.STATUS_OBJECION, OBJ.DESCRIPCION,
@@ -416,18 +385,17 @@ pub async fn get_elector(
 
     let mut rows = conn.query(sql_persona, &[&nacionalidad, &cedula]).map_err(|e| {
         log::error!("❌ Error query persona: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error query persona: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     let row_opt = rows.next().transpose().map_err(|e| {
         log::error!("❌ Error leyendo persona: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error leyendo persona: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     let row = match row_opt {
         Some(r) => r,
         None => {
-            log::warn!("⚠️ Elector no encontrado: {} {}", nacionalidad, cedula);
             return Ok(HttpResponse::NotFound().body("Elector no encontrado"));
         }
     };
@@ -453,9 +421,6 @@ pub async fn get_elector(
         ciudad, urbanizacion, sector, avenida_calle, edificio_casa, apartamento,
     ));
 
-    // =====================
-    // IDENTIFICACIÓN ELECTORAL - ÚLTIMO EVENTO
-    // =====================
     let sql_cuaderno = r#"
         SELECT nu_mesa, nu_pagina, nu_renglon, nu_edad_al_evento, fe_evento,
         cod_estado, cod_municipio, cod_parroquia, nu_centro
@@ -465,15 +430,15 @@ pub async fn get_elector(
 
     let mut rows2 = conn.query(sql_cuaderno, &[&nacionalidad, &cedula]).map_err(|e| {
         log::error!("❌ Error query cuaderno: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error query cuaderno: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     let row2_opt = rows2.next().transpose().map_err(|e| {
         log::error!("❌ Error leyendo cuaderno: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error leyendo cuaderno: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
-    let (cod_estado, cod_municipio, cod_parroquia, cod_centro): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = 
+    let (cod_estado, cod_municipio, cod_parroquia, cod_centro): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
         if let Some(r2) = row2_opt {
             resp.numero_mesa = r2.get(0).ok();
             resp.numero_pagina = r2.get(1).ok();
@@ -501,12 +466,12 @@ pub async fn get_elector(
 
         let mut rows3 = conn.query(sql_geo, &[&cc, &ce, &cm, &cp]).map_err(|e| {
             log::error!("❌ Error query vista geografica: {}", e);
-            actix_web::error::ErrorInternalServerError(format!("Error query vista geografica: {}", e))
+            actix_web::error::ErrorInternalServerError("Error interno del servidor")
         })?;
 
         if let Some(r3) = rows3.next().transpose().map_err(|e| {
             log::error!("❌ Error leyendo vista geografica: {}", e);
-            actix_web::error::ErrorInternalServerError(format!("Error leyendo vista geografica: {}", e))
+            actix_web::error::ErrorInternalServerError("Error interno del servidor")
         })? {
             let des_estado: Option<String> = r3.get(1).ok();
             let des_municipio: Option<String> = r3.get(3).ok();
@@ -519,9 +484,6 @@ pub async fn get_elector(
         }
     }
 
-    // =====================
-    // IDENTIFICACIÓN ELECTORAL - ACTUAL
-    // =====================
     let sql_centro_actual_base = r#"
         SELECT a.fecha_nacimiento_4, a.centro_votacion, ccv.codigo_nuevo, cv.estado, cv.distrito, cv.municipio
         FROM AC a, CENTRO_VOTACION cv, conversion_centro_votacion ccv
@@ -533,12 +495,12 @@ pub async fn get_elector(
 
     let mut rows_actual_base = conn.query(sql_centro_actual_base, &[&nacionalidad, &cedula]).map_err(|e| {
         log::error!("❌ Error query centro actual base: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error query centro actual base: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     if let Some(r_actual_base) = rows_actual_base.next().transpose().map_err(|e| {
         log::error!("❌ Error leyendo centro actual base: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error leyendo centro actual base: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })? {
         let codigo_centro_actual_viejo: Option<String> = r_actual_base.get(1).ok();
         let codigo_centro_actual_nuevo: Option<String> = r_actual_base.get(2).ok();
@@ -550,9 +512,9 @@ pub async fn get_elector(
             .as_deref()
             .and_then(normalize_codigo_centro_9);
 
-        if let (Some(codigo_centro_viejo), Some(ce_str), Some(cm_str), Some(cp_str)) = 
-            (codigo_centro_actual_viejo, cod_estado_actual, cod_municipio_actual, cod_parroquia_actual) {
-            
+        if let (Some(codigo_centro_viejo), Some(ce_str), Some(cm_str), Some(cp_str)) =
+            (codigo_centro_actual_viejo, cod_estado_actual, cod_municipio_actual, cod_parroquia_actual)
+        {
             let ce_num = ce_str.trim().parse::<i64>().ok();
             let cm_num = cm_str.trim().parse::<i64>().ok();
             let cp_num = cp_str.trim().parse::<i64>().ok();
@@ -578,20 +540,19 @@ pub async fn get_elector(
                     .query(sql_centro_actual_detalle, &[&codigo_centro_viejo, &cm, &ce, &cp])
                     .map_err(|e| {
                         log::error!("❌ Error query centro actual detalle: {}", e);
-                        actix_web::error::ErrorInternalServerError(format!("Error query centro actual detalle: {}", e))
+                        actix_web::error::ErrorInternalServerError("Error interno del servidor")
                     })?,
-                _ => {
-                    log::warn!("⚠️ No se pudieron convertir códigos geográficos actuales");
-                    conn.query("SELECT 1 FROM dual WHERE 1=0", &[]).map_err(|e| {
+                _ => conn
+                    .query("SELECT 1 FROM dual WHERE 1=0", &[])
+                    .map_err(|e| {
                         log::error!("❌ Error query dummy detalle actual: {}", e);
-                        actix_web::error::ErrorInternalServerError(format!("Error query dummy detalle actual: {}", e))
-                    })?
-                }
+                        actix_web::error::ErrorInternalServerError("Error interno del servidor")
+                    })?,
             };
 
             if let Some(r_actual_detalle) = rows_actual_detalle.next().transpose().map_err(|e| {
                 log::error!("❌ Error leyendo centro actual detalle: {}", e);
-                actix_web::error::ErrorInternalServerError(format!("Error leyendo centro actual detalle: {}", e))
+                actix_web::error::ErrorInternalServerError("Error interno del servidor")
             })? {
                 let des_estado_actual: Option<String> = r_actual_detalle.get(0).ok();
                 let des_municipio_actual: Option<String> = r_actual_detalle.get(1).ok();
@@ -617,9 +578,6 @@ pub async fn get_elector(
         }
     }
 
-    // =====================
-    // MIEMBRO DE MESA
-    // =====================
     set_no_aplica_miembro(&mut resp);
 
     let sql_miembro = r#"
@@ -633,12 +591,12 @@ pub async fn get_elector(
 
     let mut rowsm = conn.query(sql_miembro, &[&nacionalidad, &cedula]).map_err(|e| {
         log::error!("❌ Error query miembro_mesa: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error query miembro_mesa: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     if let Some(rm) = rowsm.next().transpose().map_err(|e| {
         log::error!("❌ Error leyendo miembro_mesa: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error leyendo miembro_mesa: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })? {
         let mesa: Option<i64> = rm.get(0).ok();
         resp.miembro_mesa_numero_mesa = Some(mesa.unwrap_or(0));
@@ -648,23 +606,28 @@ pub async fn get_elector(
         resp.miembro_mesa_nombre_centro_capacitacion = rm.get(3).ok();
 
         let desde: Option<String> = rm.get(4).ok();
-        resp.miembro_mesa_fecha_inicio_capacitacion = desde.as_deref().and_then(ddmmyyyy).or(Some("No aplica".to_string()));
+        resp.miembro_mesa_fecha_inicio_capacitacion =
+            desde.as_deref().and_then(ddmmyyyy).or(Some("No aplica".to_string()));
         let hasta: Option<String> = rm.get(5).ok();
-        resp.miembro_mesa_fecha_culminacion_capacitacion = hasta.as_deref().and_then(ddmmyyyy).or(Some("No aplica".to_string()));
+        resp.miembro_mesa_fecha_culminacion_capacitacion =
+            hasta.as_deref().and_then(ddmmyyyy).or(Some("No aplica".to_string()));
         let horario: Option<String> = rm.get(6).ok();
-        resp.miembro_mesa_horario_capacitacion = horario.as_deref().and_then(fmt_horario).or(Some("No aplica".to_string()));
+        resp.miembro_mesa_horario_capacitacion =
+            horario.as_deref().and_then(fmt_horario).or(Some("No aplica".to_string()));
         resp.miembro_mesa_direccion_centro_capacitacion = rm.get(7).ok();
     }
 
-    log::info!("✅ Datos elector obtenidos exitosamente");
+    if operador {
+        aplicar_filtro_operador(&mut resp);
+    }
 
-    if let Ok(autor_id) = obtener_id_usuario_del_token(&req, &app_state).await {
+    if let Some(autor_id) = get_autor_id(&req) {
         let ip_origen = crate::modules::logging::extract_ip(&req);
         let user_agent = crate::modules::logging::extract_user_agent(&req);
         let log_entry = log_consultar_datos_elector_entry(autor_id, cedula_int, ip_origen, user_agent);
         let pool_clone = app_state.pool_pg.clone();
         tokio::spawn(async move {
-            let _ = registrar_log(&pool_clone, log_entry).await;
+            let _ = crate::modules::logging::registrar_log(&pool_clone, log_entry).await;
         });
     }
 
@@ -672,11 +635,9 @@ pub async fn get_elector(
 }
 
 // =====================
-// Lista de electores - OPTIMIZADA (solo búsqueda por nombres y fecha)
+// Lista de electores
 // =====================
-// =====================
-// Lista de electores - OPTIMIZADA CON BÚSQUEDAS FLEXIBLES
-// =====================
+
 #[derive(Deserialize)]
 pub struct ElectoresQuery {
     pub nacionalidad: Option<String>,
@@ -712,29 +673,26 @@ pub struct ElectoresPagedResponse {
     has_more: bool,
 }
 
-// Normalizar fecha a formato YYYY-MM-DD
 fn normalize_date(input: Option<&str>) -> Option<String> {
     let s = input?.trim();
     if s.is_empty() {
         return None;
     }
-    
-    // Limpiar formato
+
     let binding = s
         .replace("--", "-")
         .replace("- -", "-")
         .replace("  ", " ")
         .replace("/", "-");
     let clean = binding.trim();
-    
-    // Formato YYYY-MM-DD
+
     if clean.contains('-') {
         let parts: Vec<&str> = clean.split('-').filter(|p| !p.is_empty()).collect();
         if parts.len() >= 3 {
             let y = parts[0];
             let m = parts[1];
             let d = parts[2];
-            
+
             if y.len() == 4 && y.chars().all(|c| c.is_ascii_digit()) {
                 let mm: u32 = m.parse().ok()?;
                 let dd: u32 = d.parse().ok()?;
@@ -744,8 +702,7 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
             }
         }
     }
-    
-    // Formato YYYYMMDD (8 dígitos)
+
     if clean.len() == 8 && clean.chars().all(|c| c.is_ascii_digit()) {
         let y = &clean[0..4];
         let m = &clean[4..6];
@@ -756,8 +713,7 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
             return Some(format!("{}-{}-{}", y, m, d));
         }
     }
-    
-    // Extraer solo dígitos
+
     let digits: String = clean.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() >= 8 {
         let y = &digits[0..4];
@@ -769,15 +725,20 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
             return Some(format!("{}-{:02}-{:02}", y, mm, dd));
         }
     }
-    
+
     None
 }
 
-// ✅ GET ELECTORES - VERSIÓN OPTIMIZADA CON BÚSQUEDAS FLEXIBLES
-pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResponse, Error> {
+pub async fn get_electores(
+    req: HttpRequest,
+    query: web::Query<ElectoresQuery>,
+) -> Result<HttpResponse, Error> {
+    if let Err(res) = require_consulta_basica(&req) {
+        return Ok(res);
+    }
+
     let q = query.into_inner();
-    
-    // Validar que al menos haya un criterio de búsqueda
+
     let hay_dato = q.cedula.is_some()
         || q.fecha_nacimiento.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
         || q.primer_nombre.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
@@ -787,42 +748,37 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         || q.codigo_centro.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
         || q.nacionalidad.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
         || q.global.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
-    
+
     if !hay_dato {
         return Err(actix_web::error::ErrorBadRequest("Ingrese al menos un dato para buscar"));
     }
-    
-    // Paginación
+
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(9).clamp(1, 100);
-    let fetch_limit = limit + 1; // Para saber si hay más
+    let fetch_limit = limit + 1;
     let offset = ((page - 1) * limit) as i64;
     let end_row = offset + fetch_limit as i64;
-    
+
     let conn = oracle_conn().map_err(|e| {
         log::error!("❌ Error conectando a Oracle: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
-    
-    // Construir WHERE dinámico
+
     let mut from_where = String::from(" FROM RE.AC_MD_VIEW WHERE 1=1 ");
     let mut binds_str: Vec<(String, String)> = vec![];
     let mut binds_i64: Vec<(String, i64)> = vec![];
-    
-    // Helper para normalizar a mayúsculas
+
     fn eq_param(s: &str) -> String {
         s.trim().to_uppercase()
     }
-    
-    // Nacionalidad
+
     if let Some(nac) = q.nacionalidad.as_ref().map(|x| x.trim().to_uppercase()) {
         if nac == "V" || nac == "E" {
             from_where.push_str(" AND NACIONALIDAD = :nacionalidad ");
             binds_str.push(("nacionalidad".into(), nac));
         }
     }
-    
-    // Cédula (búsqueda exacta)
+
     if let Some(ced) = q.cedula {
         if ced <= 0 || ced > 99_999_999 {
             return Err(actix_web::error::ErrorBadRequest("cédula inválida"));
@@ -830,42 +786,35 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         from_where.push_str(" AND CEDULA = :cedula ");
         binds_i64.push(("cedula".into(), ced));
     }
-    
-    // Fecha de nacimiento (búsqueda flexible)
+
     if let Some(fnac_input) = q.fecha_nacimiento.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         let iso = normalize_date(Some(fnac_input))
             .ok_or_else(|| actix_web::error::ErrorBadRequest("fecha_nacimiento inválida (use YYYY-MM-DD o YYYYMMDD)"))?;
-        
-        // Búsqueda por prefijo (permite buscar por año, año-mes, o fecha completa)
+
         from_where.push_str(" AND FECHA_NACIMIENTO LIKE :fecha_nacimiento || '%' ");
         binds_str.push(("fecha_nacimiento".into(), iso.replace("-", "")));
     }
-    
-    // Primer Nombre (búsqueda con LIKE para mayor flexibilidad)
+
     if let Some(s) = q.primer_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         from_where.push_str(" AND PRIMER_NOMBRE LIKE :primer_nombre || '%' ");
         binds_str.push(("primer_nombre".into(), eq_param(s)));
     }
-    
-    // Segundo Nombre
+
     if let Some(s) = q.segundo_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         from_where.push_str(" AND SEGUNDO_NOMBRE LIKE :segundo_nombre || '%' ");
         binds_str.push(("segundo_nombre".into(), eq_param(s)));
     }
-    
-    // Primer Apellido
+
     if let Some(s) = q.primer_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         from_where.push_str(" AND PRIMER_APELLIDO LIKE :primer_apellido || '%' ");
         binds_str.push(("primer_apellido".into(), eq_param(s)));
     }
-    
-    // Segundo Apellido
+
     if let Some(s) = q.segundo_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         from_where.push_str(" AND SEGUNDO_APELLIDO LIKE :segundo_apellido || '%' ");
         binds_str.push(("segundo_apellido".into(), eq_param(s)));
     }
-    
-    // Código de centro de votación
+
     if let Some(s) = q.codigo_centro.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         match s.parse::<i64>() {
             Ok(codigo) => {
@@ -873,12 +822,13 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
                 binds_i64.push(("codigo_centro".into(), codigo));
             }
             Err(_) => {
-                return Err(actix_web::error::ErrorBadRequest("codigo_centro inválido (debe ser numérico)"));
+                return Err(actix_web::error::ErrorBadRequest(
+                    "codigo_centro inválido (debe ser numérico)",
+                ));
             }
         }
     }
-    
-    // Búsqueda global (en todos los campos)
+
     if let Some(s) = q.global.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         let g = format!("%{}%", s.trim().to_uppercase());
         from_where.push_str(
@@ -891,12 +841,11 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
                 OR SEGUNDO_APELLIDO LIKE :global
                 OR FECHA_NACIMIENTO LIKE :global
                 OR TO_CHAR(CODIGO_NUEVO) LIKE :global
-            ) "
+            ) ",
         );
         binds_str.push(("global".into(), g));
     }
-    
-    // Query optimizado con ROWNUM para paginación
+
     let sql_select = format!(
         r#"
         SELECT *
@@ -921,13 +870,12 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         "#,
         from_where
     );
-    
-    // Preparar parámetros
+
     let offset_holder = offset;
     let end_row_holder = end_row;
-    
+
     let mut select_params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
-    
+
     for (k, v) in &binds_str {
         select_params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
     }
@@ -936,24 +884,20 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
     }
     select_params.push(("end_row", &end_row_holder as &dyn oracle::sql_type::ToSql));
     select_params.push(("offset", &offset_holder as &dyn oracle::sql_type::ToSql));
-    
-    log::info!("🔍 Query get_electores: {}", sql_select);
-    
-    // Ejecutar query
+
     let t_select = Instant::now();
     let mut rows_data = conn.query_named(&sql_select, &select_params).map_err(|e| {
         log::error!("❌ Error en SELECT de electores: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error SELECT: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
     log::info!("⏱️ get_electores SELECT ms = {}", t_select.elapsed().as_millis());
-    
-    // Procesar resultados
+
     let t_fetch = Instant::now();
     let mut items: Vec<ElectorListaItem> = Vec::new();
-    
+
     while let Some(row) = rows_data.next().transpose().map_err(|e| {
         log::error!("❌ Error leyendo filas: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error leyendo filas: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })? {
         let nac: String = row.get(0).unwrap_or_else(|_| "V".to_string());
         let ced: i64 = row.get(1).unwrap_or(0);
@@ -962,8 +906,7 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         let primer_apellido: Option<String> = row.get(4).ok();
         let segundo_apellido: Option<String> = row.get(5).ok();
         let fecha_raw: Option<String> = row.get(6).ok();
-        
-        // Convertir fecha de YYYYMMDD a YYYY-MM-DD
+
         let fecha_iso = if let Some(f) = fecha_raw {
             if f.len() >= 8 {
                 Some(format!("{}-{}-{}", &f[0..4], &f[4..6], &f[6..8]))
@@ -973,9 +916,9 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         } else {
             None
         };
-        
+
         let codigo_centro: Option<String> = row.get(7).ok();
-        
+
         items.push(ElectorListaItem {
             nacionalidad: nac,
             cedula: ced,
@@ -987,19 +930,18 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
             codigo_centro,
         });
     }
-    
-    // Determinar si hay más resultados
+
     let has_more = items.len() as u32 > limit;
     if has_more {
         items.truncate(limit as usize);
     }
-    
+
     log::info!(
         "⏱️ get_electores FETCH rows={} ms = {}",
         items.len(),
         t_fetch.elapsed().as_millis()
     );
-    
+
     Ok(HttpResponse::Ok().json(ElectoresPagedResponse {
         items,
         page,
@@ -1007,8 +949,9 @@ pub async fn get_electores(query: web::Query<ElectoresQuery>) -> Result<HttpResp
         has_more,
     }))
 }
+
 // =====================
-// Votos a emitir CON LOGGING
+// Votos a emitir
 // =====================
 
 #[derive(serde::Serialize, Default)]
@@ -1049,7 +992,6 @@ fn parse_i32_opt(s: Option<String>) -> i32 {
     t.parse::<i32>().unwrap_or(0)
 }
 
-// ✅ VOTOS A EMITIR CON LOGGING
 pub async fn get_votos_emitir(
     path: web::Path<(String, String)>,
     req: HttpRequest,
@@ -1057,13 +999,17 @@ pub async fn get_votos_emitir(
 ) -> Result<HttpResponse, Error> {
     use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log};
 
+    if let Err(res) = require_consulta_completa(&req) {
+        return Ok(res);
+    }
+
     let (nacionalidad_raw, cedula_raw) = path.into_inner();
     let nacionalidad = nacionalidad_raw.trim().to_uppercase();
-    let cedula: i64 = cedula_raw.trim().parse()
+    let cedula: i64 = cedula_raw
+        .trim()
+        .parse()
         .map_err(|_| actix_web::error::ErrorBadRequest("cedula inválida"))?;
     let cedula_int: i32 = cedula as i32;
-
-    log::info!("🔍 Votos Emitir - Cédula: {} {}", nacionalidad, cedula);
 
     if !(nacionalidad == "V" || nacionalidad == "E") {
         return Err(actix_web::error::ErrorBadRequest("nac debe ser V o E"));
@@ -1074,7 +1020,7 @@ pub async fn get_votos_emitir(
 
     let conn = oracle_conn().map_err(|e| {
         log::error!("❌ Error conectando a Oracle: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error conectando a Oracle: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     let sql_geo = r#"
@@ -1086,30 +1032,29 @@ pub async fn get_votos_emitir(
 
     let mut rows_geo = conn.query(sql_geo, &[&nacionalidad, &cedula]).map_err(|e| {
         log::error!("❌ Error geo query: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error geo query: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     let row_geo_opt = rows_geo.next().transpose().map_err(|e| {
         log::error!("❌ Error leyendo geo: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error leyendo geo: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     let row_geo = match row_geo_opt {
         Some(r) => r,
         None => {
-            log::warn!("⚠️ No se encontró centro de votación para cédula {}", cedula);
             return Ok(HttpResponse::Ok().json(VotosEmitirResponse::default()));
         }
     };
 
-    let cod_estado: i64 = parse_i32_opt(row_geo.get::<usize, Option<String>>(2).ok().flatten()) as i64;
-    let cod_municipio: i64 = parse_i32_opt(row_geo.get::<usize, Option<String>>(3).ok().flatten()) as i64;
-    let cod_parroq: i64 = parse_i32_opt(row_geo.get::<usize, Option<String>>(4).ok().flatten()) as i64;
-
-    log::info!("📍 Códigos geo - Estado: {}, Municipio: {}, Parroquia: {}", cod_estado, cod_municipio, cod_parroq);
+    let cod_estado: i64 =
+        parse_i32_opt(row_geo.get::<usize, Option<String>>(2).ok().flatten()) as i64;
+    let cod_municipio: i64 =
+        parse_i32_opt(row_geo.get::<usize, Option<String>>(3).ok().flatten()) as i64;
+    let cod_parroq: i64 =
+        parse_i32_opt(row_geo.get::<usize, Option<String>>(4).ok().flatten()) as i64;
 
     if cod_estado == 0 || cod_municipio == 0 || cod_parroq == 0 {
-        log::warn!("⚠️ Códigos geo inválidos para cédula {}", cedula);
         return Ok(HttpResponse::Ok().json(VotosEmitirResponse::default()));
     }
 
@@ -1124,20 +1069,21 @@ pub async fn get_votos_emitir(
         WHERE cod_estado = :cod_estado AND cod_municipio = :cod_municipio AND cod_parroq = :cod_parroq
     "#;
 
-    let mut rows_v = conn.query(sql_votos, &[&cod_estado, &cod_municipio, &cod_parroq]).map_err(|e| {
-        log::error!("❌ Error votos query: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error votos query: {}", e))
-    })?;
+    let mut rows_v = conn
+        .query(sql_votos, &[&cod_estado, &cod_municipio, &cod_parroq])
+        .map_err(|e| {
+            log::error!("❌ Error votos query: {}", e);
+            actix_web::error::ErrorInternalServerError("Error interno del servidor")
+        })?;
 
     let row_v_opt = rows_v.next().transpose().map_err(|e| {
         log::error!("❌ Error leyendo votos: {}", e);
-        actix_web::error::ErrorInternalServerError(format!("Error leyendo votos: {}", e))
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
     })?;
 
     let r = match row_v_opt {
         Some(x) => x,
         None => {
-            log::warn!("⚠️ No hay votos para estado={}, municipio={}, parroquia={}", cod_estado, cod_municipio, cod_parroq);
             return Ok(HttpResponse::Ok().json(VotosEmitirResponse::default()));
         }
     };
@@ -1175,9 +1121,7 @@ pub async fn get_votos_emitir(
         referendos: get_s(25),
     };
 
-    log::info!("✅ Votos a emitir obtenidos exitosamente");
-
-    if let Ok(autor_id) = obtener_id_usuario_del_token(&req, &app_state).await {
+    if let Some(autor_id) = get_autor_id(&req) {
         let ip_origen = extract_ip(&req);
         let user_agent = extract_user_agent(&req);
         let log_entry = log_votos_emitir_entry(autor_id, cedula_int, ip_origen, user_agent);

@@ -1,9 +1,10 @@
-// src/modules/ac.rs
-use actix_web::{web, HttpResponse, Error};
+use actix_web::{web, Error, HttpRequest, HttpResponse};
+use log::{error, info, warn};
 use oracle::Connection;
 use serde::{Deserialize, Serialize};
 use std::env;
-use log::{info, error, warn};
+
+use crate::middleware::auth::require_consulta_completa;
 
 // ✅ Función de conexión simplificada
 fn oracle_conn() -> Result<Connection, oracle::Error> {
@@ -12,11 +13,14 @@ fn oracle_conn() -> Result<Connection, oracle::Error> {
     let oracle_ip = env::var("ORACLE_IP").expect("ORACLE_IP faltante");
     let oracle_port = env::var("ORACLE_PORT").expect("ORACLE_PORT faltante");
     let oracle_db = env::var("ORACLE_DB").expect("ORACLE_DB faltante");
-    
+
     let connect_string = format!("//{oracle_ip}:{oracle_port}/{oracle_db}");
-    
-    info!("🔗 Conectando a Oracle: {}@{}:{}/{}", username, oracle_ip, oracle_port, oracle_db);
-    
+
+    info!(
+        "🔗 Conectando a Oracle: {}@{}:{}/{}",
+        username, oracle_ip, oracle_port, oracle_db
+    );
+
     Connection::connect(username, password, connect_string)
 }
 
@@ -37,19 +41,24 @@ struct ErrorResponse {
 }
 
 pub async fn get_usuario_by_ac(
+    req: HttpRequest,
     path: web::Path<(String, i64)>,
 ) -> Result<HttpResponse, Error> {
+    if let Err(res) = require_consulta_completa(&req) {
+        return Ok(res);
+    }
+
     let (nacionalidad_raw, cedula) = path.into_inner();
     let nacionalidad = nacionalidad_raw.trim().to_uppercase();
-    
+
     info!("🔍 Buscando elector: {} - {}", nacionalidad, cedula);
-    
+
     // ✅ Validación
     if !(nacionalidad == "V" || nacionalidad == "E") {
         warn!("⚠️ Nacionalidad inválida: {}", nacionalidad);
         return Err(actix_web::error::ErrorBadRequest("nacionalidad debe ser V o E"));
     }
-    
+
     if cedula <= 0 {
         warn!("⚠️ Cédula inválida: {}", cedula);
         return Err(actix_web::error::ErrorBadRequest("cedula debe ser mayor a 0"));
@@ -60,11 +69,11 @@ pub async fn get_usuario_by_ac(
         Ok(c) => {
             info!("✅ Conexión Oracle exitosa");
             c
-        },
+        }
         Err(e) => {
             error!("❌ Error conectando a Oracle: {}", e);
             return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
-                error: format!("Error conectando a Oracle: {}", e),
+                error: "Error interno del servidor".to_string(),
             }));
         }
     };
@@ -88,11 +97,11 @@ pub async fn get_usuario_by_ac(
         Ok(r) => {
             info!("✅ Query ejecutado correctamente");
             r
-        },
+        }
         Err(e) => {
             error!("❌ Error en query Oracle: {}", e);
             return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
-                error: format!("Error consultando Oracle: {}", e),
+                error: "Error interno del servidor".to_string(),
             }));
         }
     };
@@ -103,7 +112,7 @@ pub async fn get_usuario_by_ac(
         Err(e) => {
             error!("❌ Error leyendo resultado: {}", e);
             return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
-                error: format!("Error leyendo datos: {}", e),
+                error: "Error interno del servidor".to_string(),
             }));
         }
     };
@@ -112,7 +121,7 @@ pub async fn get_usuario_by_ac(
         Some(r) => {
             info!("✅ Elector encontrado");
             r
-        },
+        }
         None => {
             warn!("⚠️ Elector no encontrado: {} - {}", nacionalidad, cedula);
             return Ok(HttpResponse::NotFound().json(ErrorResponse {
