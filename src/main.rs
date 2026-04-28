@@ -1,5 +1,7 @@
 #![allow(non_snake_case)]
+
 use actix_cors::Cors;
+use actix_files::Files;
 use actix_web::{web, App, HttpServer};
 use dotenvy::dotenv;
 use sqlx::postgres::PgPool;
@@ -50,6 +52,7 @@ async fn main() -> std::io::Result<()> {
     println!("🔐 JWT: Configurado");
     println!("🛡️ Protección: Honeypot + CAPTCHA + Rate Limiting + Auth middleware");
     println!("🌐 CORS: {}", allowed_origin);
+    println!("📁 Archivos públicos: /files -> ./files/templates");
 
     HttpServer::new(move || {
         App::new()
@@ -74,6 +77,26 @@ async fn main() -> std::io::Result<()> {
                 login_attempts: login_attempts.clone(),
                 captcha_store: captcha_store.clone(),
             }))
+
+            // =====================================================
+            // ✅ ARCHIVOS PÚBLICOS
+            // =====================================================
+            // Esto permite acceder públicamente a:
+            // /files/templates/guia_rapida.pdf
+            // /files/templates/guia_rapida_admin.pdf
+            //
+            // Los archivos deben estar físicamente en:
+            // ./files/templates/guia_rapida.pdf
+            // ./files/templates/guia_rapida_admin.pdf
+            //
+            // IMPORTANTE:
+            // Esta ruta NO pasa por AuthMiddleware.
+            // =====================================================
+            .service(
+                Files::new("/files", "./files/templates")
+                    .use_last_modified(true)
+            )
+
             .service(
                 web::scope("/api")
                     // =========================
@@ -85,6 +108,7 @@ async fn main() -> std::io::Result<()> {
                         "/verificar/{codigo}",
                         web::get().to(modules::exportacion::verificar_documento),
                     )
+
                     // =========================
                     // RUTAS PRIVADAS
                     // =========================
