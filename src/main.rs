@@ -2,7 +2,8 @@
 
 use actix_cors::Cors;
 use actix_files::Files;
-use actix_web::{web, App, HttpServer};
+use actix_web::http::header;
+use actix_web::{web, App, HttpResponse, HttpServer};
 use dotenvy::dotenv;
 use sqlx::postgres::PgPool;
 use std::collections::HashMap;
@@ -20,6 +21,36 @@ mod utils;
 mod middleware;
 use middleware::auth::AuthMiddleware;
 use middleware::security_headers::SecurityHeaders;
+
+// =====================================================
+// ✅ VISUALIZADOR INLINE DE PDFs PÚBLICOS
+// =====================================================
+// Esta función permite abrir los PDF en el visor del navegador
+// en vez de forzar la descarga.
+// =====================================================
+async fn ver_pdf(path: web::Path<String>) -> actix_web::Result<HttpResponse> {
+    let filename = path.into_inner();
+
+    // ✅ Lista blanca: solo permite estos archivos
+    let allowed_files = ["guia_rapida.pdf", "guia_rapida_admin.pdf"];
+
+    if !allowed_files.contains(&filename.as_str()) {
+        return Ok(HttpResponse::NotFound().finish());
+    }
+
+    let file_path = format!("./files/templates/{}", filename);
+
+    match std::fs::read(&file_path) {
+        Ok(bytes) => Ok(HttpResponse::Ok()
+            .insert_header((header::CONTENT_TYPE, "application/pdf"))
+            .insert_header((
+                header::CONTENT_DISPOSITION,
+                format!("inline; filename=\"{}\"", filename),
+            ))
+            .body(bytes)),
+        Err(_) => Ok(HttpResponse::NotFound().finish()),
+    }
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -53,6 +84,7 @@ async fn main() -> std::io::Result<()> {
     println!("🛡️ Protección: Honeypot + CAPTCHA + Rate Limiting + Auth middleware");
     println!("🌐 CORS: {}", allowed_origin);
     println!("📁 Archivos públicos: /files -> ./files/templates");
+    println!("📄 PDFs inline: /files/guia_rapida.pdf y /files/guia_rapida_admin.pdf");
 
     HttpServer::new(move || {
         App::new()
@@ -79,18 +111,27 @@ async fn main() -> std::io::Result<()> {
             }))
 
             // =====================================================
-            // ✅ ARCHIVOS PÚBLICOS
+            // ✅ PDFs PÚBLICOS INLINE
             // =====================================================
-            // Esto permite acceder públicamente a:
-            // /files/templates/guia_rapida.pdf
-            // /files/templates/guia_rapida_admin.pdf
-            //
-            // Los archivos deben estar físicamente en:
-            // ./files/templates/guia_rapida.pdf
-            // ./files/templates/guia_rapida_admin.pdf
+            // Estas rutas se abren en el visor del navegador:
+            // /files/guia_rapida.pdf
+            // /files/guia_rapida_admin.pdf
             //
             // IMPORTANTE:
             // Esta ruta NO pasa por AuthMiddleware.
+            // =====================================================
+            .route("/files/{filename}", web::get().to(ver_pdf))
+
+            // =====================================================
+            // ✅ ARCHIVOS PÚBLICOS GENERALES
+            // =====================================================
+            // Esto permite acceder públicamente a otros archivos de:
+            // ./files/templates
+            //
+            // Ejemplo:
+            // /files/plantilla.xlsx
+            //
+            // Los PDF anteriores pasan primero por ver_pdf.
             // =====================================================
             .service(
                 Files::new("/files", "./files/templates")
