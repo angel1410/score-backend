@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
+// ✅ Roles del sistema
+const ROL_ADMINISTRADOR: i32 = 1;
+const ROL_SISTEMAS: i32 = 4;
+
+// ✅ Roles que pueden iniciar sesión aunque la fecha_cierre esté vencida
+fn puede_ingresar_fuera_de_fecha(id_rol: i32) -> bool {
+    matches!(id_rol, ROL_ADMINISTRADOR | ROL_SISTEMAS)
+}
+
 // ✅ Estructura de entrada con las 3 protecciones
 #[derive(Deserialize)]
 pub struct InfoLogin {
@@ -319,31 +328,56 @@ pub async fn get_login(
         });
     }
 
-    if login_data.id_rol != 1 {
-        let fecha_cierre: Option<NaiveDate> = sqlx::query_scalar(
+    // ✅ 6. Validar fecha_cierre solo para roles que NO están exentos
+    //
+    // Roles exentos:
+    // - 1 ADMINISTRADOR
+    // - 4 SISTEMAS
+    //
+    // Roles sujetos a fecha_cierre:
+    // - 2 CONSULTOR
+    // - 3 OPERADOR
+    if !puede_ingresar_fuera_de_fecha(login_data.id_rol) {
+        let fecha_cierre_result = sqlx::query_scalar::<_, Option<NaiveDate>>(
             "SELECT p_date FROM parametros WHERE nombre_parametro = 'fecha_cierre'",
         )
         .fetch_optional(pool)
-        .await
-        .unwrap_or(None);
+        .await;
+
+        let fecha_cierre: Option<NaiveDate> = match fecha_cierre_result {
+            Ok(Some(fecha)) => fecha,
+            Ok(None) => None,
+            Err(e) => {
+                error!("Error consultando fecha_cierre: {}", e);
+                return HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: "Error validando fecha de cierre".to_string(),
+                });
+            }
+        };
 
         if let Some(fecha) = fecha_cierre {
             let hoy = Local::now().naive_local().date();
 
             if hoy > fecha {
                 warn!(
-                    "⚠️ Fecha de cierre vencida - Cédula: {}, Fecha cierre: {}, Hoy: {}",
-                    cedula, fecha, hoy
+                    "⚠️ Fecha de cierre vencida - Cédula: {}, Rol: {}, Fecha cierre: {}, Hoy: {}",
+                    cedula, login_data.id_rol, fecha, hoy
                 );
+
                 return HttpResponse::Forbidden().json(ErrorResponse {
                     error: "Acceso denegado. La fecha límite para inicio de sesión ha vencido."
                         .to_string(),
                 });
             }
         }
+    } else {
+        info!(
+            "✅ Usuario exento de fecha_cierre - Cédula: {}, Rol: {} ({})",
+            cedula, login_data.id_rol, login_data.nombre_rol
+        );
     }
 
-    // ✅ 9. Generar JWT Token con role
+    // ✅ 7. Generar JWT Token con role
     let now = Utc::now();
     let expiration = match now.checked_add_signed(Duration::hours(4)) {
         Some(exp) => exp.timestamp(),
