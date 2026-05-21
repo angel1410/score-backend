@@ -176,6 +176,10 @@ async fn main() -> std::io::Result<()> {
                                 web::put().to(modules::reactivar_usuario),
                             )
                             .route(
+                                "/cambiar-password-inicial",
+                                web::post().to(modules::cambiar_password_inicial),
+                            )
+                            .route(
                                 "/usuarios/{id}/bloquear",
                                 web::put().to(modules::bloquear_usuario),
                             )

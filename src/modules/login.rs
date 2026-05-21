@@ -335,8 +335,8 @@ pub async fn get_login(
     // - 4 SISTEMAS
     //
     // Roles sujetos a fecha_cierre:
-    // - 2 CONSULTOR
-    // - 3 OPERADOR
+// - 2 DIRECTOR
+// - 3 OPERADOR
     if !puede_ingresar_fuera_de_fecha(login_data.id_rol) {
         let fecha_cierre_result = sqlx::query_scalar::<_, Option<NaiveDate>>(
             "SELECT p_date FROM parametros WHERE nombre_parametro = 'fecha_cierre'",

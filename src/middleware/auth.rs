@@ -133,7 +133,7 @@ pub fn get_current_role(req: &HttpRequest) -> Result<String, HttpResponse> {
 fn normalize_role(role: &str) -> String {
     match role.trim().to_uppercase().as_str() {
         "1" | "ADMINISTRADOR" | "ADMIN" => "ADMINISTRADOR".to_string(),
-        "2" | "CONSULTOR" => "CONSULTOR".to_string(),
+        "2" | "DIRECTOR" | "CONSULTOR" => "DIRECTOR".to_string(),
         "3" | "OPERADOR" => "OPERADOR".to_string(),
         "4" | "SISTEMAS" | "SISTEMA" => "SISTEMAS".to_string(),
         other => other.to_string(),
@@ -162,7 +162,7 @@ pub fn require_admin_or_sistemas(req: &HttpRequest) -> Result<(), HttpResponse> 
 }
 
 pub fn require_consulta_completa(req: &HttpRequest) -> Result<(), HttpResponse> {
-    require_any_role(req, &["1", "2", "4", "ADMINISTRADOR", "CONSULTOR", "SISTEMAS"])
+    require_any_role(req, &["1", "2", "4", "ADMINISTRADOR", "DIRECTOR", "CONSULTOR", "SISTEMAS"])
 }
 
 pub fn require_consulta_basica(req: &HttpRequest) -> Result<(), HttpResponse> {
@@ -174,8 +174,8 @@ pub fn require_consulta_basica(req: &HttpRequest) -> Result<(), HttpResponse> {
             "3",
             "4",
             "ADMINISTRADOR",
+            "DIRECTOR",
             "CONSULTOR",
-            "OPERADOR",
             "SISTEMAS",
         ],
     )
@@ -185,8 +185,12 @@ pub fn is_operador(req: &HttpRequest) -> bool {
     matches!(get_current_role(req), Ok(role) if role == "OPERADOR")
 }
 
+pub fn is_director(req: &HttpRequest) -> bool {
+    matches!(get_current_role(req), Ok(role) if role == "DIRECTOR")
+}
+
 pub fn is_consultor(req: &HttpRequest) -> bool {
-    matches!(get_current_role(req), Ok(role) if role == "CONSULTOR")
+    is_director(req)
 }
 
 pub fn is_administrador(req: &HttpRequest) -> bool {
@@ -204,6 +208,6 @@ pub fn is_admin_or_sistemas(req: &HttpRequest) -> bool {
 pub fn is_consulta_completa(req: &HttpRequest) -> bool {
     matches!(
         get_current_role(req),
-        Ok(role) if role == "ADMINISTRADOR" || role == "CONSULTOR" || role == "SISTEMAS"
+        Ok(role) if role == "ADMINISTRADOR" || role == "DIRECTOR" || role == "SISTEMAS"
     )
 }

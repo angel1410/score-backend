@@ -72,6 +72,13 @@ pub struct UsuarioUpdate {
     pub id_rol: i32,
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+pub struct CambiarPasswordInicialRequest {
+    pub password_actual: String,
+    pub password_nueva: String,
+    pub password_confirmacion: String,
+}
+
 #[derive(Serialize)]
 pub struct UsuarioConPassword {
     pub usuario: Usuario,
@@ -539,7 +546,7 @@ pub async fn crear_usuario(
     .bind(&username)
     .bind(&hashed_password)
     .bind(usuario.activo)
-    .bind(usuario.expira)
+    .bind(true)
     .bind(usuario.id_rol)
     .fetch_one(&app_state.pool_pg)
     .await
@@ -734,6 +741,112 @@ pub async fn actualizar_usuario(
     });
 
     HttpResponse::Ok().json(updated_user)
+}
+
+pub async fn cambiar_password_inicial(
+    app_state: web::Data<AppState>,
+    req: actix_web::HttpRequest,
+    body: web::Json<CambiarPasswordInicialRequest>,
+) -> impl Responder {
+    let user_id = match get_current_user_id(&req) {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    let password_actual = body.password_actual.trim();
+    let password_nueva = body.password_nueva.trim();
+    let password_confirmacion = body.password_confirmacion.trim();
+
+    if password_actual.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "Ingrese la contraseña actual"
+        }));
+    }
+
+    if password_nueva.len() < 6 {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "La nueva contraseña debe tener mínimo 6 caracteres"
+        }));
+    }
+
+    if password_nueva != password_confirmacion {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "La confirmación no coincide con la nueva contraseña"
+        }));
+    }
+
+    if password_actual == password_nueva {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "La nueva contraseña debe ser diferente a la contraseña actual"
+        }));
+    }
+
+    let password_actual_hash = format!(
+        "{:x}",
+        Sha256::digest(password_actual.as_bytes())
+    );
+
+    let usuario = match sqlx::query(
+        "SELECT id, password, activo, eliminado FROM usuarios WHERE id = $1"
+    )
+    .bind(user_id)
+    .fetch_optional(&app_state.pool_pg)
+    .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return HttpResponse::NotFound().json(serde_json::json!({
+                "error": "Usuario no encontrado"
+            }));
+        }
+        Err(e) => {
+            log::error!("Error consultando usuario para cambio de contraseña: {}", e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Error interno del servidor"
+            }));
+        }
+    };
+
+    let activo: bool = usuario.get("activo");
+    let eliminado: bool = usuario.get("eliminado");
+
+    if !activo || eliminado {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "Usuario no autorizado para cambiar contraseña"
+        }));
+    }
+
+    let password_bd: String = usuario.get("password");
+
+    if password_bd != password_actual_hash {
+        return HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "La contraseña actual es incorrecta"
+        }));
+    }
+
+    let nueva_hash = format!(
+        "{:x}",
+        Sha256::digest(password_nueva.as_bytes())
+    );
+
+    match sqlx::query(
+        "UPDATE usuarios SET password = $1, expira = FALSE WHERE id = $2"
+    )
+    .bind(nueva_hash)
+    .bind(user_id)
+    .execute(&app_state.pool_pg)
+    .await
+    {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({
+            "message": "Contraseña actualizada correctamente"
+        })),
+        Err(e) => {
+            log::error!("Error actualizando contraseña inicial: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "No se pudo actualizar la contraseña"
+            }))
+        }
+    }
 }
 
 pub async fn bloquear_usuario(
@@ -1053,7 +1166,7 @@ pub async fn confirmar_carga_masiva(
                            eliminado = FALSE, eliminado_en = NULL, eliminado_por = NULL,
                            nacionalidad = $1, cedula = $2, primer_nombre = $3, segundo_nombre = $4,
                            primer_apellido = $5, segundo_apellido = $6, password = $7,
-                           activo = TRUE, expira = FALSE, id_rol = $8, username = $9
+                           activo = TRUE, expira = TRUE, id_rol = $8, username = $9
                            WHERE id = $10"#,
                     )
                     .bind(&fila.nacionalidad)
@@ -1161,7 +1274,7 @@ pub async fn confirmar_carga_masiva(
         .bind(&username)
         .bind(&hashed_password)
         .bind(true)
-        .bind(false)
+        .bind(true)
         .bind(fila.id_rol)
         .fetch_optional(&app_state.pool_pg)
         .await;

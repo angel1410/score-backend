@@ -27,6 +27,7 @@ pub use users::{
     get_roles,
     crear_usuario,
     actualizar_usuario,
+    cambiar_password_inicial,
     bloquear_usuario,
     eliminar_usuario,
     reactivar_usuario,
