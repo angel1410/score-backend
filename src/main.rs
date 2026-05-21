@@ -169,6 +169,10 @@ async fn main() -> std::io::Result<()> {
                             )
                             .route("/usuarios", web::get().to(modules::get_usuarios))
                             .route("/usuarios", web::post().to(modules::crear_usuario))
+                            .route(
+                                "/usuarios/{id}/reset-password",
+                                web::put().to(modules::resetear_password_usuario),
+                            )
                             .route("/usuarios/{id}", web::put().to(modules::actualizar_usuario))
                             .route("/usuarios/{id}", web::delete().to(modules::eliminar_usuario))
                             .route(

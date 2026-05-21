@@ -28,6 +28,7 @@ pub use users::{
     crear_usuario,
     actualizar_usuario,
     cambiar_password_inicial,
+    resetear_password_usuario,
     bloquear_usuario,
     eliminar_usuario,
     reactivar_usuario,

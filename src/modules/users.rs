@@ -12,7 +12,7 @@ use sqlx::Row;
 use std::io::Cursor;
 use std::path::PathBuf;
 
-use crate::middleware::auth::{get_current_user_id, require_admin_or_sistemas};
+use crate::middleware::auth::{get_current_user_id, require_any_role};
 use crate::structs::AppState;
 
 // ============================================
@@ -82,6 +82,12 @@ pub struct CambiarPasswordInicialRequest {
 #[derive(Serialize)]
 pub struct UsuarioConPassword {
     pub usuario: Usuario,
+    pub password_generada: String,
+}
+
+#[derive(Serialize)]
+pub struct ResetPasswordResponse {
+    pub message: String,
     pub password_generada: String,
 }
 
@@ -221,6 +227,13 @@ fn generar_password(primer_nombre: &str, primer_apellido: &str, cedula: i32) -> 
 fn validar_longitud_cedula(cedula: i32) -> bool {
     let cedula_str = cedula.to_string();
     cedula_str.len() >= 6 && cedula_str.len() <= 8
+}
+
+fn require_gestion_usuarios(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
+    require_any_role(
+        req,
+        &["1", "2", "4", "ADMINISTRADOR", "DIRECTOR", "SISTEMAS"],
+    )
 }
 
 // ============================================
@@ -407,7 +420,7 @@ pub async fn get_usuarios(
     req: actix_web::HttpRequest,
     app_state: web::Data<AppState>,
 ) -> impl Responder {
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
@@ -436,7 +449,7 @@ pub async fn get_roles(
     req: actix_web::HttpRequest,
     app_state: web::Data<AppState>,
 ) -> impl Responder {
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
@@ -462,7 +475,7 @@ pub async fn crear_usuario(
 ) -> impl Responder {
     use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
 
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
@@ -593,7 +606,7 @@ pub async fn reactivar_usuario(
 ) -> impl Responder {
     use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
 
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
@@ -669,7 +682,7 @@ pub async fn actualizar_usuario(
 ) -> impl Responder {
     use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
 
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
@@ -741,6 +754,88 @@ pub async fn actualizar_usuario(
     });
 
     HttpResponse::Ok().json(updated_user)
+}
+
+
+pub async fn resetear_password_usuario(
+    app_state: web::Data<AppState>,
+    req: actix_web::HttpRequest,
+    id: web::Path<i32>,
+) -> impl Responder {
+    use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
+
+    if let Err(res) = require_gestion_usuarios(&req) {
+        return res;
+    }
+
+    let user_id = id.into_inner();
+
+    let usuario = match sqlx::query_as::<_, Usuario>(
+        "SELECT id, id_rol, nacionalidad, cedula, primer_nombre, segundo_nombre,
+         primer_apellido, segundo_apellido, username, password, activo, expira
+         FROM usuarios WHERE id = $1 AND eliminado = FALSE",
+    )
+    .bind(user_id)
+    .fetch_one(&app_state.pool_pg)
+    .await
+    {
+        Ok(u) => u,
+        Err(e) => {
+            log::error!("Usuario no encontrado para resetear contraseña: {}", e);
+            return HttpResponse::NotFound().json(serde_json::json!({
+                "error": "Usuario no encontrado"
+            }));
+        }
+    };
+
+    let password_generada = generar_password(
+        &usuario.primer_nombre,
+        &usuario.primer_apellido,
+        usuario.cedula,
+    );
+    let hashed_password = format!("{:x}", Sha256::digest(password_generada.as_bytes()));
+
+    match sqlx::query(
+        "UPDATE usuarios SET password = $1, expira = TRUE WHERE id = $2"
+    )
+    .bind(&hashed_password)
+    .bind(user_id)
+    .execute(&app_state.pool_pg)
+    .await
+    {
+        Ok(_) => {
+            let ip_origen = extract_ip(&req);
+            let user_agent = extract_user_agent(&req);
+            let autor_id = obtener_id_usuario_del_token(&req).ok();
+
+            let log_entry = LogEntry {
+                id_tipo_accion: 2,
+                id_accion: 4,
+                id_usuario: autor_id,
+                accion: "RESETEAR CONTRASEÑA".to_string(),
+                cedula_relacionada: Some(usuario.cedula),
+                ip_origen,
+                user_agent,
+            };
+
+            let pool_clone = app_state.pool_pg.clone();
+            tokio::spawn(async move {
+                let _ = registrar_log(&pool_clone, log_entry).await;
+            });
+
+            HttpResponse::Ok().json(ResetPasswordResponse {
+                message: "Contraseña reseteada correctamente".to_string(),
+                password_generada,
+            })
+        }
+        Err(e) => {
+            log::error!("Error reseteando contraseña: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "No se pudo resetear la contraseña",
+                "details": e.to_string()
+            }))
+        }
+    }
 }
 
 pub async fn cambiar_password_inicial(
@@ -856,7 +951,7 @@ pub async fn bloquear_usuario(
 ) -> impl Responder {
     use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
 
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
@@ -936,7 +1031,7 @@ pub async fn eliminar_usuario(
 ) -> impl Responder {
     use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
 
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
@@ -1012,7 +1107,7 @@ pub async fn validar_carga_masiva(
     req: actix_web::HttpRequest,
     mut payload: Multipart,
 ) -> impl Responder {
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
@@ -1067,7 +1162,7 @@ pub async fn confirmar_carga_masiva(
 ) -> impl Responder {
     use crate::modules::logging::{extract_ip, extract_user_agent, registrar_log, LogEntry};
 
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
@@ -1708,7 +1803,7 @@ fn calcular_resumen_preview(filas: Vec<FilaPreview>) -> CargaMasivaPreview {
 pub async fn descargar_plantilla(
     req: actix_web::HttpRequest,
 ) -> Result<HttpResponse, Error> {
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return Ok(res);
     }
 
@@ -1740,7 +1835,7 @@ pub async fn descargar_carga_masiva_excel(
     app_state: web::Data<AppState>,
     path: web::Path<i32>,
 ) -> impl Responder {
-    if let Err(res) = require_admin_or_sistemas(&req) {
+    if let Err(res) = require_gestion_usuarios(&req) {
         return res;
     }
 
