@@ -1,6 +1,8 @@
+#![allow(dead_code)]
 use actix_web::{web, Error, HttpRequest, HttpResponse};
 use oracle::{Connection, Row, RowValue};
 use serde::Deserialize;
+use sqlx::Row as SqlxRow;
 use std::env;
 use std::time::Instant;
 
@@ -199,14 +201,14 @@ pub struct ElectorResponse {
     pub codigo_centro_actual: Option<String>,
     pub nombre_centro_actual: Option<String>,
     pub direccion_centro_actual: Option<String>,
-    pub miembro_mesa_numero_mesa: Option<i64>,
+    pub miembro_mesa_es_miembro: Option<bool>,
+    pub miembro_mesa_organismo: Option<String>,
     pub miembro_mesa_cargo: Option<String>,
-    pub miembro_mesa_centro_capacitacion: Option<String>,
-    pub miembro_mesa_nombre_centro_capacitacion: Option<String>,
-    pub miembro_mesa_fecha_inicio_capacitacion: Option<String>,
-    pub miembro_mesa_fecha_culminacion_capacitacion: Option<String>,
-    pub miembro_mesa_horario_capacitacion: Option<String>,
-    pub miembro_mesa_direccion_centro_capacitacion: Option<String>,
+    pub miembro_mesa_numero_mesa: Option<i64>,
+    pub miembro_mesa_codigo_mesa: Option<i64>,
+    pub miembro_mesa_mesa_electoral: Option<i64>,
+    pub miembro_mesa_tipo_sorteo: Option<i64>,
+    pub miembro_mesa_codigo_centro: Option<String>,
 }
 
 fn yyyymmdd_to_iso(s: &str) -> Option<String> {
@@ -323,14 +325,14 @@ fn fmt_horario(s: &str) -> Option<String> {
 }
 
 fn set_no_aplica_miembro(resp: &mut ElectorResponse) {
-    resp.miembro_mesa_numero_mesa = Some(0);
+    resp.miembro_mesa_es_miembro = Some(false);
+    resp.miembro_mesa_organismo = Some("No aplica".to_string());
     resp.miembro_mesa_cargo = Some("No aplica".to_string());
-    resp.miembro_mesa_centro_capacitacion = Some("0".to_string());
-    resp.miembro_mesa_nombre_centro_capacitacion = Some("No aplica".to_string());
-    resp.miembro_mesa_fecha_inicio_capacitacion = Some("No aplica".to_string());
-    resp.miembro_mesa_fecha_culminacion_capacitacion = Some("No aplica".to_string());
-    resp.miembro_mesa_horario_capacitacion = Some("No aplica".to_string());
-    resp.miembro_mesa_direccion_centro_capacitacion = Some("No aplica".to_string());
+    resp.miembro_mesa_numero_mesa = None;
+    resp.miembro_mesa_codigo_mesa = None;
+    resp.miembro_mesa_mesa_electoral = None;
+    resp.miembro_mesa_tipo_sorteo = None;
+    resp.miembro_mesa_codigo_centro = Some("No aplica".to_string());
 }
 
 fn aplicar_filtro_operador(resp: &mut ElectorResponse) {
@@ -581,41 +583,92 @@ pub async fn get_elector(
     set_no_aplica_miembro(&mut resp);
 
     let sql_miembro = r#"
-        SELECT miembro.mesa, cargo_miembro.descripcion_cargo, miembro.centrocap, c_capacitacion.nombre,
-        miembro.tallerdesde, miembro.tallerhasta, miembro.horario, c_capacitacion.direccion
-        FROM miembros_oes miembro, cargos_miembros_oes cargo_miembro, tipos_oes t_oes, MC.centro_capacitacion c_capacitacion
-        WHERE t_oes.tipo_oes = cargo_miembro.tipo_oes AND cargo_miembro.tipo_oes = miembro.timioes
-        AND miembro.cargo = cargo_miembro.cod_cargo AND miembro.centrocap = c_capacitacion.codigo
-        AND miembro.nac = :nacionalidad AND miembro.cedula = :cedula
-    "#;
+    SELECT
+        mm.nac,
+        mm.cedula,
+        mm.cod_centro,
+        mm.cod_cargo,
+        COALESCE(c.cargo, 'No aplica') AS cargo,
+        mm.tipo_sorteo,
+        COALESCE(o.organismo, 'No aplica') AS organismo,
+        mm.cod_mesa,
+        mm.mesa_electoral,
+        CASE
+            WHEN mm.centro_nuevo IS NULL
+              OR TRIM(mm.centro_nuevo) = ''
+              OR TRIM(mm.centro_nuevo) = '0'
+            THEN NULL
+            ELSE LPAD(REGEXP_REPLACE(mm.centro_nuevo, '\D', '', 'g'), 9, '0')
+        END AS centro_nuevo
+    FROM miembros_mesa mm
+    LEFT JOIN miembros_mesa_cargos c
+        ON c.cod_org = mm.tipo_sorteo
+       AND c.cod_cargo = mm.cod_cargo
+    LEFT JOIN miembros_mesa_organismos o
+        ON o.cod_org = mm.tipo_sorteo
+    WHERE mm.nac = $1
+      AND mm.cedula = $2
+    LIMIT 1
+"#;
 
-    let mut rowsm = conn.query(sql_miembro, &[&nacionalidad, &cedula]).map_err(|e| {
-        log::error!("❌ Error query miembro_mesa: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
+match sqlx::query(sql_miembro)
+    .bind(&nacionalidad)
+    .bind(cedula_int)
+    .fetch_optional(&app_state.pool_pg)
+    .await
+{
+    Ok(Some(miembro_row)) => {
+        let cargo: String = miembro_row
+            .try_get("cargo")
+            .unwrap_or_else(|_| "No aplica".to_string());
 
-    if let Some(rm) = rowsm.next().transpose().map_err(|e| {
-        log::error!("❌ Error leyendo miembro_mesa: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })? {
-        let mesa: Option<i64> = rm.get(0).ok();
-        resp.miembro_mesa_numero_mesa = Some(mesa.unwrap_or(0));
-        resp.miembro_mesa_cargo = rm.get(1).ok();
-        let centrocap: Option<String> = rm.get(2).ok();
-        resp.miembro_mesa_centro_capacitacion = Some(centrocap.unwrap_or_else(|| "0".to_string()));
-        resp.miembro_mesa_nombre_centro_capacitacion = rm.get(3).ok();
+        let organismo: String = miembro_row
+            .try_get("organismo")
+            .unwrap_or_else(|_| "No aplica".to_string());
 
-        let desde: Option<String> = rm.get(4).ok();
-        resp.miembro_mesa_fecha_inicio_capacitacion =
-            desde.as_deref().and_then(ddmmyyyy).or(Some("No aplica".to_string()));
-        let hasta: Option<String> = rm.get(5).ok();
-        resp.miembro_mesa_fecha_culminacion_capacitacion =
-            hasta.as_deref().and_then(ddmmyyyy).or(Some("No aplica".to_string()));
-        let horario: Option<String> = rm.get(6).ok();
-        resp.miembro_mesa_horario_capacitacion =
-            horario.as_deref().and_then(fmt_horario).or(Some("No aplica".to_string()));
-        resp.miembro_mesa_direccion_centro_capacitacion = rm.get(7).ok();
+        let tipo_sorteo: Option<i32> = miembro_row
+            .try_get("tipo_sorteo")
+            .ok()
+            .flatten();
+
+        let cod_mesa: Option<i32> = miembro_row
+            .try_get("cod_mesa")
+            .ok()
+            .flatten();
+
+        let mesa_electoral: Option<i32> = miembro_row
+            .try_get("mesa_electoral")
+            .ok()
+            .flatten();
+
+        let centro_nuevo: Option<String> = miembro_row
+            .try_get("centro_nuevo")
+            .ok()
+            .flatten();
+
+        resp.miembro_mesa_es_miembro = Some(true);
+        resp.miembro_mesa_organismo = Some(organismo);
+        resp.miembro_mesa_cargo = Some(cargo);
+        resp.miembro_mesa_numero_mesa = mesa_electoral.map(|v| v as i64);
+        resp.miembro_mesa_codigo_mesa = cod_mesa.map(|v| v as i64);
+        resp.miembro_mesa_mesa_electoral = mesa_electoral.map(|v| v as i64);
+        resp.miembro_mesa_tipo_sorteo = tipo_sorteo.map(|v| v as i64);
+        resp.miembro_mesa_codigo_centro = Some(
+            centro_nuevo
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "No aplica".to_string()),
+        );
     }
+    Ok(None) => {
+        set_no_aplica_miembro(&mut resp);
+    }
+    Err(e) => {
+        log::error!("❌ Error consultando miembro_mesa en PostgreSQL: {}", e);
+        return Err(actix_web::error::ErrorInternalServerError(
+            "Error interno del servidor",
+        ));
+    }
+}
 
     if operador {
         aplicar_filtro_operador(&mut resp);
