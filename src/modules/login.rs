@@ -89,13 +89,23 @@ pub async fn get_captcha(state: web::Data<structs::AppState>) -> HttpResponse {
     let operations = ['+', '-'];
     let op = operations[rng.gen_range(0..operations.len())];
 
-    let num1: i32 = rng.gen_range(1..15);
-    let num2: i32 = rng.gen_range(1..15);
-
-    let result: i32 = match op {
-        '+' => num1 + num2,
-        '-' => num1.saturating_sub(num2),
-        _ => num1 + num2,
+    let (num1, num2, result) = match op {
+        '+' => {
+            let n1: i32 = rng.gen_range(1..15);
+            let n2: i32 = rng.gen_range(1..15);
+            (n1, n2, n1 + n2)
+        }
+        '-' => {
+            // ✅ Para resta: garantizamos num1 > num2 para que el resultado sea siempre positivo (> 0)
+            let n1: i32 = rng.gen_range(2..20);
+            let n2: i32 = rng.gen_range(1..n1);
+            (n1, n2, n1 - n2)
+        }
+        _ => {
+            let n1: i32 = rng.gen_range(1..15);
+            let n2: i32 = rng.gen_range(1..15);
+            (n1, n2, n1 + n2)
+        }
     };
 
     let id: String = (0..32)
@@ -113,7 +123,7 @@ pub async fn get_captcha(state: web::Data<structs::AppState>) -> HttpResponse {
         );
     }
 
-    info!("🧮 CAPTCHA generado");
+    info!("🧮 CAPTCHA generado: {} {} {} = {}", num1, op, num2, result);
 
     HttpResponse::Ok().json(CaptchaResponse {
         id,
@@ -209,7 +219,12 @@ pub async fn get_login(
                         store.remove(captcha_id);
                         false
                     } else {
-                        entry.answer == *captcha_answer
+                        let answer_user = captcha_answer.trim();
+                        let answer_expected = entry.answer.trim();
+
+                        answer_user == answer_expected
+                            || (answer_user.parse::<i32>().is_ok()
+                                && answer_user.parse::<i32>() == answer_expected.parse::<i32>())
                     }
                 } else {
                     false
