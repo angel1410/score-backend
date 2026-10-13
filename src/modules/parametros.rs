@@ -198,3 +198,20 @@ pub async fn get_fecha_cierre(app_state: web::Data<AppState>) -> impl Responder 
         }
     }
 }
+
+// ✅ FUNCIÓN ESPECIAL: Obtener versión del sistema (Pública para LoginPage)
+pub async fn get_version_sistema(app_state: web::Data<AppState>) -> impl Responder {
+    match sqlx::query_scalar::<_, Option<String>>(
+        "SELECT p_text FROM parametros WHERE nombre_parametro = 'version_sistema' LIMIT 1"
+    )
+    .fetch_optional(&app_state.pool_pg)
+    .await
+    {
+        Ok(Some(Some(version))) => HttpResponse::Ok().json(serde_json::json!({
+            "version": version
+        })),
+        _ => HttpResponse::Ok().json(serde_json::json!({
+            "version": "3.2"
+        })),
+    }
+}

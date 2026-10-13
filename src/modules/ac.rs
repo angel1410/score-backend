@@ -1,28 +1,9 @@
 use actix_web::{web, Error, HttpRequest, HttpResponse};
 use log::{error, info, warn};
-use oracle::Connection;
 use serde::{Deserialize, Serialize};
-use std::env;
 
 use crate::middleware::auth::require_consulta_completa;
-
-// ✅ Función de conexión simplificada
-fn oracle_conn() -> Result<Connection, oracle::Error> {
-    let username = env::var("ORACLE_USER").expect("ORACLE_USER faltante");
-    let password = env::var("ORACLE_PASS").expect("ORACLE_PASS faltante");
-    let oracle_ip = env::var("ORACLE_IP").expect("ORACLE_IP faltante");
-    let oracle_port = env::var("ORACLE_PORT").expect("ORACLE_PORT faltante");
-    let oracle_db = env::var("ORACLE_DB").expect("ORACLE_DB faltante");
-
-    let connect_string = format!("//{oracle_ip}:{oracle_port}/{oracle_db}");
-
-    info!(
-        "🔗 Conectando a Oracle: {}@{}:{}/{}",
-        username, oracle_ip, oracle_port, oracle_db
-    );
-
-    Connection::connect(username, password, connect_string)
-}
+use crate::structs::AppState;
 
 #[derive(Deserialize, Serialize, Default, Debug)]
 pub struct UsuarioAC {
@@ -43,6 +24,7 @@ struct ErrorResponse {
 pub async fn get_usuario_by_ac(
     req: HttpRequest,
     path: web::Path<(String, i64)>,
+    app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
     if let Err(res) = require_consulta_completa(&req) {
         return Ok(res);
@@ -64,14 +46,11 @@ pub async fn get_usuario_by_ac(
         return Err(actix_web::error::ErrorBadRequest("cedula debe ser mayor a 0"));
     }
 
-    // ✅ Conexión Oracle con logging
-    let conn = match oracle_conn() {
-        Ok(c) => {
-            info!("✅ Conexión Oracle exitosa");
-            c
-        }
+    // ✅ Conexión Oracle desde el Pool (reutiliza conexión existente)
+    let conn = match app_state.pool_oracle.get() {
+        Ok(c) => c,
         Err(e) => {
-            error!("❌ Error conectando a Oracle: {}", e);
+            error!("❌ Error obteniendo conexión de Oracle Pool: {}", e);
             return Ok(HttpResponse::InternalServerError().json(ErrorResponse {
                 error: "Error interno del servidor".to_string(),
             }));

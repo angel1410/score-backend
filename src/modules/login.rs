@@ -114,11 +114,13 @@ pub async fn get_captcha(state: web::Data<structs::AppState>) -> HttpResponse {
 
     {
         let mut store = state.captcha_store.lock().unwrap();
+        let ahora = Utc::now();
+        store.retain(|_, entry| ahora - entry.created_at < chrono::Duration::minutes(5));
         store.insert(
             id.clone(),
             structs::CaptchaEntry {
                 answer: result.to_string(),
-                created_at: Utc::now(),
+                created_at: ahora,
             },
         );
     }
@@ -174,6 +176,8 @@ pub async fn get_login(
 
     {
         let mut attempts = state.login_attempts.lock().unwrap();
+        let ahora = Utc::now();
+        attempts.retain(|_, tracker| ahora - tracker.last_attempt < Duration::minutes(15));
 
         if let Some(tracker) = attempts.get(&client_ip) {
             if tracker.count >= 5 {
@@ -540,4 +544,110 @@ pub async fn get_logout(
     HttpResponse::Ok().json(serde_json::json!({
         "message": "Sesión cerrada exitosamente"
     }))
+}
+
+// ✅ Endpoint para renovación silenciosa de token JWT
+pub async fn refresh_token(
+    req: actix_web::HttpRequest,
+    state: web::Data<structs::AppState>,
+) -> HttpResponse {
+    use crate::middleware::auth::get_current_user_id;
+
+    let user_id = match get_current_user_id(&req) {
+        Ok(id) => id,
+        Err(res) => return res,
+    };
+
+    let row_query = match sqlx::query(
+        r#"
+        SELECT u.id, u.id_rol, COALESCE(r.nombre_rol, 'SIN_ROL') AS nombre_rol,
+               u.nacionalidad, u.cedula, u.primer_nombre, u.segundo_nombre,
+               u.primer_apellido, u.segundo_apellido, u.username, u.activo, u.expira
+        FROM usuarios u
+        LEFT JOIN roles r ON u.id_rol = r.id
+        WHERE u.id = $1 AND u.eliminado = FALSE
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool_pg)
+    .await
+    {
+        Ok(Some(row)) => DatosLogin {
+            id: row.get(0),
+            id_rol: row.get(1),
+            nombre_rol: row.get::<Option<String>, _>(2).unwrap_or_else(|| "SIN_ROL".to_string()),
+            nacionalidad: row.get(3),
+            cedula: row.get(4),
+            primer_nombre: row.get(5),
+            segundo_nombre: row.get(6),
+            primer_apellido: row.get(7),
+            segundo_apellido: row.get(8),
+            username: row.get(9),
+            activo: row.get(10),
+            expira: row.get(11),
+        },
+        Ok(None) => {
+            return HttpResponse::Unauthorized().json(ErrorResponse {
+                error: "Usuario no encontrado o sesión revocada".to_string(),
+            });
+        }
+        Err(e) => {
+            error!("Error consultando usuario para refresh token: {}", e);
+            return HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Error interno del servidor".to_string(),
+            });
+        }
+    };
+
+    if !row_query.activo {
+        return HttpResponse::Forbidden().json(ErrorResponse {
+            error: "Usuario inactivo. Contacte al administrador.".to_string(),
+        });
+    }
+
+    let now = Utc::now();
+    let expiration = match now.checked_add_signed(Duration::hours(4)) {
+        Some(exp) => exp.timestamp(),
+        None => {
+            return HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Error calculando expiración".to_string(),
+            });
+        }
+    };
+
+    let claims = Claims {
+        sub: row_query.id.to_string(),
+        role: row_query.id_rol.to_string(),
+        exp: expiration as usize,
+        iat: now.timestamp() as usize,
+    };
+
+    let token = match encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Error renovando token: {}", e);
+            return HttpResponse::InternalServerError().json(ErrorResponse {
+                error: "Error renovando token".to_string(),
+            });
+        }
+    };
+
+    let now_local = Local::now();
+    let server_time = ServerTimeInfo {
+        timestamp: now.timestamp(),
+        timestamp_ms: now.timestamp_millis(),
+        iso8601_utc: now.to_rfc3339(),
+        iso8601_local: now_local.to_rfc3339(),
+        timezone: now_local.format("%Z").to_string(),
+    };
+
+    HttpResponse::Ok().json(LoginResponse {
+        token,
+        user: row_query,
+        server_time,
+    })
 }

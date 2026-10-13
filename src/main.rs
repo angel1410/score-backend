@@ -3,6 +3,7 @@
 use actix_cors::Cors;
 use actix_files::Files;
 use actix_web::http::header;
+use actix_web::middleware::Compress;
 use actix_web::{web, App, HttpResponse, HttpServer};
 use dotenvy::dotenv;
 use sqlx::postgres::PgPool;
@@ -58,11 +59,20 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
 
     // ✅ Variables Oracle
-    let _oracle_user = env::var("ORACLE_USER").expect("ORACLE_USER faltante");
-    let _oracle_pass = env::var("ORACLE_PASS").expect("ORACLE_PASS faltante");
-    let _oracle_ip = env::var("ORACLE_IP").expect("ORACLE_IP faltante");
-    let _oracle_port = env::var("ORACLE_PORT").expect("ORACLE_PORT faltante");
-    let _oracle_db = env::var("ORACLE_DB").expect("ORACLE_DB faltante");
+    let oracle_user = env::var("ORACLE_USER").expect("ORACLE_USER faltante");
+    let oracle_pass = env::var("ORACLE_PASS").expect("ORACLE_PASS faltante");
+    let oracle_ip = env::var("ORACLE_IP").expect("ORACLE_IP faltante");
+    let oracle_port = env::var("ORACLE_PORT").expect("ORACLE_PORT faltante");
+    let oracle_db = env::var("ORACLE_DB").expect("ORACLE_DB faltante");
+    let oracle_connect_str = format!("//{oracle_ip}:{oracle_port}/{oracle_db}");
+
+    // ✅ Pool de conexiones a Oracle (evita el handshake TCP/Auth por cada consulta)
+    let pool_oracle = oracle::pool::PoolBuilder::new(&oracle_user, &oracle_pass, &oracle_connect_str)
+        .min_connections(2)
+        .max_connections(10)
+        .build()
+        .expect("Error creando pool de conexiones a Oracle");
+    let pool_oracle = Arc::new(pool_oracle);
 
     // ✅ Variables principales
     let allowed_origin =
@@ -88,6 +98,7 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .wrap(Compress::default())
             .wrap(SecurityHeaders)
             .wrap(
                 Cors::default()
@@ -105,6 +116,7 @@ async fn main() -> std::io::Result<()> {
             )
             .app_data(web::Data::new(structs::AppState {
                 pool_pg: pool_pg.clone(),
+                pool_oracle: pool_oracle.clone(),
                 jwt_secret: jwt_secret.clone(),
                 login_attempts: login_attempts.clone(),
                 captcha_store: captcha_store.clone(),
@@ -143,8 +155,10 @@ async fn main() -> std::io::Result<()> {
                     // =========================
                     // RUTAS PÚBLICAS
                     // =========================
+                    .route("/health", web::get().to(modules::get_health_status))
                     .route("/login", web::post().to(modules::get_login))
                     .route("/captcha", web::get().to(modules::get_captcha))
+                    .route("/version", web::get().to(modules::get_version_sistema))
                     .route(
                         "/verificar/{codigo}",
                         web::get().to(modules::exportacion::verificar_documento),
@@ -156,6 +170,7 @@ async fn main() -> std::io::Result<()> {
                     .service(
                         web::scope("")
                             .wrap(AuthMiddleware)
+                            .route("/refresh-token", web::post().to(modules::refresh_token))
                             .route("/logout", web::post().to(modules::get_logout))
                             .route(
                                 "/get-movimientos-re/{nacionalidad}/{cedula}",

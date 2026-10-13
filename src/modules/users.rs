@@ -3,7 +3,7 @@ use actix_multipart::Multipart;
 use actix_web::{web, Error, HttpResponse, Responder};
 use calamine::{DataType as CalamineDataType, Reader, Xls, Xlsx};
 use csv::ReaderBuilder;
-use futures_util::TryStreamExt;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use log::info;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -240,28 +240,14 @@ fn require_gestion_usuarios(req: &actix_web::HttpRequest) -> Result<(), HttpResp
 // CONSULTAR AC CON DATOS COMPLETOS
 // ============================================
 
-async fn consultar_ac(nacionalidad: &str, cedula: i32) -> Result<Option<ACData>, String> {
-    use oracle::Connection;
-    use std::env;
-
-    let username =
-        env::var("ORACLE_USER").map_err(|e| format!("ORACLE_USER no configurado: {}", e))?;
-    let password =
-        env::var("ORACLE_PASS").map_err(|e| format!("ORACLE_PASS no configurado: {}", e))?;
-    let oracle_ip =
-        env::var("ORACLE_IP").map_err(|e| format!("ORACLE_IP no configurado: {}", e))?;
-    let oracle_port =
-        env::var("ORACLE_PORT").map_err(|e| format!("ORACLE_PORT no configurado: {}", e))?;
-    let oracle_db =
-        env::var("ORACLE_DB").map_err(|e| format!("ORACLE_DB no configurado: {}", e))?;
-
-    log::info!("🔗 Oracle: {}@{}:{}/{}", username, oracle_ip, oracle_port, oracle_db);
-
-    let connect_string = format!("//{}:{}/{}", oracle_ip, oracle_port, oracle_db);
-
-    let conn = Connection::connect(&username, &password, &connect_string).map_err(|e| {
-        log::error!("❌ Error Oracle: {}", e);
-        format!("Error conectando a Oracle: {}", e)
+async fn consultar_ac(
+    pool_oracle: &oracle::pool::Pool,
+    nacionalidad: &str,
+    cedula: i32,
+) -> Result<Option<ACData>, String> {
+    let conn = pool_oracle.get().map_err(|e| {
+        log::error!("❌ Error obteniendo conexión de Oracle Pool: {}", e);
+        format!("Error en pool Oracle: {}", e)
     })?;
 
     let sql = "SELECT NACIONALIDAD, CEDULA, PRIMER_NOMBRE, NVL(SEGUNDO_NOMBRE, '') as SEGUNDO_NOMBRE,
@@ -496,7 +482,7 @@ pub async fn crear_usuario(
         return HttpResponse::BadRequest().body("cedula inválida");
     }
 
-    if let Ok(Some(ac_data)) = consultar_ac(&nacionalidad, cedula).await {
+    if let Ok(Some(ac_data)) = consultar_ac(&app_state.pool_oracle, &nacionalidad, cedula).await {
         if ac_data.status_objecion != Some(0) {
             return HttpResponse::BadRequest().json(serde_json::json!({
                 "error": "No se puede crear el usuario",
@@ -1231,7 +1217,7 @@ pub async fn confirmar_carga_masiva(
             continue;
         }
 
-        if let Ok(Some(ac_data)) = consultar_ac(&fila.nacionalidad, fila.cedula).await {
+        if let Ok(Some(ac_data)) = consultar_ac(&app_state.pool_oracle, &fila.nacionalidad, fila.cedula).await {
             if ac_data.status_objecion != Some(0) {
                 fallidos += 1;
                 detalles.push(format!(
@@ -1549,7 +1535,7 @@ async fn validar_range_preview(
     range: calamine::Range<CalamineDataType>,
     app_state: web::Data<AppState>,
 ) -> Result<CargaMasivaPreview, String> {
-    let mut filas = Vec::new();
+    let mut row_items = Vec::new();
     let mut row_idx = 0;
 
     for row in range.rows() {
@@ -1558,22 +1544,7 @@ async fn validar_range_preview(
             continue;
         }
         if row.len() < 6 {
-            filas.push(FilaPreview {
-                fila: row_idx,
-                nacionalidad: "".to_string(),
-                cedula: 0,
-                estado: "INVALIDO".to_string(),
-                excel_primer_nombre: "".to_string(),
-                excel_segundo_nombre: "".to_string(),
-                excel_primer_apellido: "".to_string(),
-                excel_segundo_apellido: "".to_string(),
-                ac_primer_nombre: None,
-                ac_segundo_nombre: None,
-                ac_primer_apellido: None,
-                ac_segundo_apellido: None,
-                discrepancias: vec![],
-                mensaje_error: Some("Columnas insuficientes (se esperan 6)".to_string()),
-            });
+            row_items.push((row_idx, None));
             continue;
         }
 
@@ -1608,26 +1579,64 @@ async fn validar_range_preview(
             _ => "".to_string(),
         };
 
-        let fila_preview = procesar_fila_preview(
-            app_state.clone(),
+        row_items.push((
             row_idx,
-            nacionalidad,
-            cedula,
-            primer_nombre,
-            segundo_nombre,
-            primer_apellido,
-            segundo_apellido,
-        )
-        .await;
-
-        filas.push(fila_preview);
+            Some((
+                nacionalidad,
+                cedula,
+                primer_nombre,
+                segundo_nombre,
+                primer_apellido,
+                segundo_apellido,
+            )),
+        ));
     }
+
+    // Procesamiento concurrente de hasta 5 filas en paralelo respetando el pool de conexiones
+    let futures_stream = stream::iter(row_items.into_iter().map(|(idx, data)| {
+        let state = app_state.clone();
+        async move {
+            match data {
+                Some((nac, ced, p_nom, s_nom, p_ape, s_ape)) => {
+                    procesar_fila_preview(
+                        state,
+                        idx,
+                        nac,
+                        ced,
+                        p_nom,
+                        s_nom,
+                        p_ape,
+                        s_ape,
+                    )
+                    .await
+                }
+                None => FilaPreview {
+                    fila: idx,
+                    nacionalidad: "".to_string(),
+                    cedula: 0,
+                    estado: "INVALIDO".to_string(),
+                    excel_primer_nombre: "".to_string(),
+                    excel_segundo_nombre: "".to_string(),
+                    excel_primer_apellido: "".to_string(),
+                    excel_segundo_apellido: "".to_string(),
+                    ac_primer_nombre: None,
+                    ac_segundo_nombre: None,
+                    ac_primer_apellido: None,
+                    ac_segundo_apellido: None,
+                    discrepancias: vec![],
+                    mensaje_error: Some("Columnas insuficientes (se esperan 6)".to_string()),
+                },
+            }
+        }
+    }));
+
+    let filas: Vec<FilaPreview> = futures_stream.buffered(5).collect().await;
 
     Ok(calcular_resumen_preview(filas))
 }
 
 async fn procesar_fila_preview(
-    _app_state: web::Data<AppState>,
+    app_state: web::Data<AppState>,
     fila: usize,
     nacionalidad: String,
     cedula: i32,
@@ -1697,7 +1706,7 @@ async fn procesar_fila_preview(
         };
     }
 
-    match consultar_ac(&nacionalidad, cedula).await {
+    match consultar_ac(&app_state.pool_oracle, &nacionalidad, cedula).await {
         Ok(Some(ac_data)) => {
             if ac_data.status_objecion != Some(0) {
                 return FilaPreview {

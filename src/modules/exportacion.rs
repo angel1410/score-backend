@@ -105,22 +105,32 @@ pub async fn verificar_documento(
     }
 
     // Extraer cédula del código (última parte)
-    let cedula = partes[partes.len() - 1];
+    let cedula_str = partes[partes.len() - 1];
+    let cedula_int: i32 = match cedula_str.parse() {
+        Ok(c) => c,
+        Err(_) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "valido": false,
+                "mensaje": "Cédula en código no es válida",
+                "codigo": codigo.to_string()
+            }));
+        }
+    };
     let timestamp_str = partes[1];
     let timestamp: Option<i64> = timestamp_str.parse().ok();
 
-    // ✅ Buscar en logs si existe esta exportación
+    // ✅ Buscar en logs si existe esta exportación usando índice numérico
     let existe = sqlx::query!(
         r#"
         SELECT 
             COUNT(*) as count,
             MAX(created_at) as ultima_exportacion
         FROM logs
-        WHERE cedula_relacionada::text = $1
+        WHERE cedula_relacionada = $1
             AND id_tipo_accion = 3
             AND id_accion = 9
         "#,
-        cedula
+        cedula_int
     )
     .fetch_optional(&state.pool_pg)
     .await;
@@ -131,8 +141,8 @@ pub async fn verificar_documento(
                 "valido": true,
                 "mensaje": "Documento verificado correctamente",
                 "codigo": codigo.to_string(),
-                "cedula": cedula,
-                "timestamp":timestamp,
+                "cedula": cedula_int,
+                "timestamp": timestamp,
                 "ultima_exportacion": row.ultima_exportacion
             }))
         },

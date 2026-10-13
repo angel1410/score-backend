@@ -13,6 +13,7 @@ pub struct CaptchaEntry {
 #[derive(Clone)]
 pub struct AppState {
     pub pool_pg: PgPool,
+    pub pool_oracle: Arc<oracle::pool::Pool>,
     pub jwt_secret: String,
     pub login_attempts: Arc<Mutex<HashMap<String, AttemptTracker>>>,
     pub captcha_store: Arc<Mutex<HashMap<String, CaptchaEntry>>>,

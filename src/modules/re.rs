@@ -1,9 +1,8 @@
 #![allow(dead_code)]
 use actix_web::{web, Error, HttpRequest, HttpResponse};
-use oracle::{Connection, Row, RowValue};
+use oracle::{Row, RowValue};
 use serde::Deserialize;
 use sqlx::Row as SqlxRow;
-use std::env;
 use std::time::Instant;
 
 use crate::middleware::auth::{
@@ -79,16 +78,6 @@ impl RowValue for MovimientoRE {
     }
 }
 
-fn oracle_conn() -> Result<Connection, oracle::Error> {
-    let username = env::var("ORACLE_USER").unwrap();
-    let password = env::var("ORACLE_PASS").unwrap();
-    let oracle_ip = env::var("ORACLE_IP").unwrap();
-    let oracle_port = env::var("ORACLE_PORT").unwrap();
-    let oracle_db = env::var("ORACLE_DB").unwrap();
-    let connect_string = format!("//{oracle_ip}:{oracle_port}/{oracle_db}");
-    Connection::connect(username, password, connect_string)
-}
-
 // =====================
 // Movimiento RE
 // =====================
@@ -114,40 +103,53 @@ pub async fn get_movimientos_re(
         return Err(actix_web::error::ErrorBadRequest("nacionalidad inválida"));
     }
 
-    let conn = oracle_conn().map_err(|e| {
-        log::error!("❌ Error conectando a Oracle: {}", e);
+    let pool_oracle = app_state.pool_oracle.clone();
+    let nac_clone = nacionalidad.clone();
+
+    let re_array = web::block(move || -> Result<Vec<MovimientoRE>, String> {
+        let conn = pool_oracle.get().map_err(|e| {
+            log::error!("❌ Error obteniendo conexión de Oracle Pool: {}", e);
+            e.to_string()
+        })?;
+
+        let sql = "SELECT
+            t.CIERRE, c.NOMBRE_CORTO, t.ID_LOTE, tm.DESCRIPCION DESCRIPCION_MOVIMIENTO,
+            spm.descripcion DESCRIPCION_STATUS, t.FECHA_PROCESO_MOV
+            from re.movimiento t
+            left join re.cierre c
+            on t.cierre=c.codigo
+            left join re.tipo_movimiento tm
+            on t.tipo_movimiento=tm.tipo_movimiento
+            left join re.status_proceso_mov spm
+            on t.status_proceso_mov=spm.codigo
+            where t.nacionalidad= :nacionalidad
+            And T.Cedula_Number= :cedula
+            order by cierre desc";
+
+        let rows = conn
+            .query_as::<MovimientoRE>(sql, &[&nac_clone, &cedula_int])
+            .map_err(|e| {
+                log::error!("❌ Error ejecutando query: {}", e);
+                e.to_string()
+            })?;
+
+        let mut re_array: Vec<MovimientoRE> = Vec::new();
+        for row_result in rows {
+            let mov = row_result.map_err(|e| {
+                log::error!("❌ Error procesando fila: {}", e);
+                e.to_string()
+            })?;
+            re_array.push(mov);
+        }
+
+        Ok(re_array)
+    })
+    .await
+    .map_err(|e| {
+        log::error!("❌ Error en blocking task movimientos: {}", e);
         actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-
-    let sql = "SELECT
-        t.CIERRE, c.NOMBRE_CORTO, t.ID_LOTE, tm.DESCRIPCION DESCRIPCION_MOVIMIENTO,
-        spm.descripcion DESCRIPCION_STATUS, t.FECHA_PROCESO_MOV
-        from re.movimiento t
-        left join re.cierre c
-        on t.cierre=c.codigo
-        left join re.tipo_movimiento tm
-        on t.tipo_movimiento=tm.tipo_movimiento
-        left join re.status_proceso_mov spm
-        on t.status_proceso_mov=spm.codigo
-        where t.nacionalidad= :nacionalidad
-        And T.Cedula_Number= :cedula
-        order by cierre desc";
-
-    let rows = conn
-        .query_as::<MovimientoRE>(sql, &[&nacionalidad, &cedula_str])
-        .map_err(|e| {
-            log::error!("❌ Error ejecutando query: {}", e);
-            actix_web::error::ErrorInternalServerError("Error interno del servidor")
-        })?;
-
-    let mut re_array: Vec<MovimientoRE> = Vec::new();
-    for row_result in rows {
-        let mov = row_result.map_err(|e| {
-            log::error!("❌ Error procesando fila: {}", e);
-            actix_web::error::ErrorInternalServerError("Error interno del servidor")
-        })?;
-        re_array.push(mov);
-    }
+    })?
+    .map_err(|_| actix_web::error::ErrorInternalServerError("Error interno del servidor"))?;
 
     if let Some(autor_id) = get_autor_id(&req) {
         let ip_origen = crate::modules::logging::extract_ip(&req);
@@ -364,223 +366,206 @@ pub async fn get_elector(
         return Err(actix_web::error::ErrorBadRequest("cedula inválida"));
     }
 
-    let conn = oracle_conn().map_err(|e| {
-        log::error!("❌ Error conectando a Oracle: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
+    let pool_oracle = app_state.pool_oracle.clone();
+    let nac_clone = nacionalidad.clone();
 
-    let mut resp = ElectorResponse {
-        nacionalidad: nacionalidad.clone(),
-        cedula,
-        ..Default::default()
-    };
-
-    let sql_persona = r#"
-        SELECT AC.PRIMER_APELLIDO, AC.SEGUNDO_APELLIDO, AC.PRIMER_NOMBRE, AC.SEGUNDO_NOMBRE,
-        AC.FECHA_NACIMIENTO_4, AC.STATUS_OBJECION, OBJ.DESCRIPCION,
-        MD.CIUDAD, MD.URBANIZACION, MD.SECTOR, MD.AVENIDA_CALLE, MD.EDIFICIO_CASA, MD.APARTAMENTO
-        FROM AC AC
-        JOIN OBJECION OBJ ON AC.STATUS_OBJECION = OBJ.STATUS
-        LEFT JOIN RE.MAESTRO_DIRECCION MD ON MD.NACIONALIDAD = AC.NACIONALIDAD AND MD.CEDULA = AC.CEDULA
-        WHERE AC.NACIONALIDAD = :nacionalidad AND AC.CEDULA = :cedula
-    "#;
-
-    let mut rows = conn.query(sql_persona, &[&nacionalidad, &cedula]).map_err(|e| {
-        log::error!("❌ Error query persona: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-
-    let row_opt = rows.next().transpose().map_err(|e| {
-        log::error!("❌ Error leyendo persona: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-
-    let row = match row_opt {
-        Some(r) => r,
-        None => {
-            return Ok(HttpResponse::NotFound().body("Elector no encontrado"));
-        }
-    };
-
-    resp.primer_apellido = row.get(0).ok();
-    resp.segundo_apellido = row.get(1).ok();
-    resp.primer_nombre = row.get(2).ok();
-    resp.segundo_nombre = row.get(3).ok();
-    let fecha_raw: Option<String> = row.get(4).ok();
-    resp.fecha_nacimiento = fecha_raw.as_deref().and_then(yyyymmdd_to_iso);
-    let cod_obj: Option<i64> = row.get(5).ok();
-    resp.codigo_objecion = cod_obj.map(|x| x.to_string());
-    resp.descripcion_objecion = row.get(6).ok();
-
-    let ciudad: Option<String> = row.get(7).ok();
-    let urbanizacion: Option<String> = row.get(8).ok();
-    let sector: Option<String> = row.get(9).ok();
-    let avenida_calle: Option<String> = row.get(10).ok();
-    let edificio_casa: Option<String> = row.get(11).ok();
-    let apartamento: Option<String> = row.get(12).ok();
-
-    resp.direccion_elector = Some(build_direccion_elector(
-        ciudad, urbanizacion, sector, avenida_calle, edificio_casa, apartamento,
-    ));
-
-    let sql_cuaderno = r#"
-        SELECT nu_mesa, nu_pagina, nu_renglon, nu_edad_al_evento, fe_evento,
-        cod_estado, cod_municipio, cod_parroquia, nu_centro
-        FROM instrumentos.cuaderno_actual2
-        WHERE co_nacionalidad = :nacionalidad AND nu_cedula = :cedula
-    "#;
-
-    let mut rows2 = conn.query(sql_cuaderno, &[&nacionalidad, &cedula]).map_err(|e| {
-        log::error!("❌ Error query cuaderno: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-
-    let row2_opt = rows2.next().transpose().map_err(|e| {
-        log::error!("❌ Error leyendo cuaderno: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-
-    let (cod_estado, cod_municipio, cod_parroquia, cod_centro): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
-        if let Some(r2) = row2_opt {
-            resp.numero_mesa = r2.get(0).ok();
-            resp.numero_pagina = r2.get(1).ok();
-            resp.numero_renglon = r2.get(2).ok();
-            resp.edad_ultimo_evento = r2.get(3).ok();
-            let fe: Option<String> = r2.get(4).ok();
-            resp.fecha_ultimo_evento = fe.map(|x| x.chars().take(10).collect());
-            let ce: Option<i64> = r2.get(5).ok();
-            let cm: Option<i64> = r2.get(6).ok();
-            let cp: Option<i64> = r2.get(7).ok();
-            let cc: Option<i64> = r2.get(8).ok();
-            resp.codigo_centro = cc.map(pad9);
-            (ce, cm, cp, cc)
-        } else {
-            (None, None, None, None)
-        };
-
-    if let (Some(ce), Some(cm), Some(cp), Some(cc)) = (cod_estado, cod_municipio, cod_parroquia, cod_centro) {
-        let sql_geo = r#"
-            SELECT COD_ESTADO, DES_ESTADO, COD_MUNICIPIO, DES_MUNICIPIO, COD_PARROQUIA,
-            DES_PARROQUIA, CODIGO_NUEVO, NOMBRE, DIRECCION
-            FROM RE.V_CENTRO_VOTACION_GEOGRAFICO
-            WHERE CODIGO_NUEVO = :cc AND COD_ESTADO = :ce AND COD_MUNICIPIO = :cm AND COD_PARROQUIA = :cp
-        "#;
-
-        let mut rows3 = conn.query(sql_geo, &[&cc, &ce, &cm, &cp]).map_err(|e| {
-            log::error!("❌ Error query vista geografica: {}", e);
-            actix_web::error::ErrorInternalServerError("Error interno del servidor")
+    let resp_opt = web::block(move || -> Result<Option<ElectorResponse>, String> {
+        let conn = pool_oracle.get().map_err(|e| {
+            log::error!("❌ Error obteniendo conexión de Oracle Pool: {}", e);
+            e.to_string()
         })?;
 
-        if let Some(r3) = rows3.next().transpose().map_err(|e| {
-            log::error!("❌ Error leyendo vista geografica: {}", e);
-            actix_web::error::ErrorInternalServerError("Error interno del servidor")
-        })? {
-            let des_estado: Option<String> = r3.get(1).ok();
-            let des_municipio: Option<String> = r3.get(3).ok();
-            let des_parroquia: Option<String> = r3.get(5).ok();
-            resp.estado = Some(fmt_geo(ce, des_estado));
-            resp.municipio = Some(fmt_geo(cm, des_municipio));
-            resp.parroquia = Some(fmt_geo(cp, des_parroquia));
-            resp.nombre_centro = r3.get(7).ok();
-            resp.direccion_centro = r3.get(8).ok();
-        }
-    }
+        let mut resp = ElectorResponse {
+            nacionalidad: nac_clone.clone(),
+            cedula,
+            ..Default::default()
+        };
 
-    let sql_centro_actual_base = r#"
-        SELECT a.fecha_nacimiento_4, a.centro_votacion, ccv.codigo_nuevo, cv.estado, cv.distrito, cv.municipio
-        FROM AC a, CENTRO_VOTACION cv, conversion_centro_votacion ccv
-        WHERE a.NACIONALIDAD = :nacionalidad
-        AND a.CEDULA = :cedula
-        AND a.centro_votacion = cv.codigo
-        AND a.centro_votacion = ccv.codigo_actual
-    "#;
+        let sql_persona = r#"
+            SELECT AC.PRIMER_APELLIDO, AC.SEGUNDO_APELLIDO, AC.PRIMER_NOMBRE, AC.SEGUNDO_NOMBRE,
+            AC.FECHA_NACIMIENTO_4, AC.STATUS_OBJECION, OBJ.DESCRIPCION,
+            MD.CIUDAD, MD.URBANIZACION, MD.SECTOR, MD.AVENIDA_CALLE, MD.EDIFICIO_CASA, MD.APARTAMENTO
+            FROM AC AC
+            JOIN OBJECION OBJ ON AC.STATUS_OBJECION = OBJ.STATUS
+            LEFT JOIN RE.MAESTRO_DIRECCION MD ON MD.NACIONALIDAD = AC.NACIONALIDAD AND MD.CEDULA = AC.CEDULA
+            WHERE AC.NACIONALIDAD = :nacionalidad AND AC.CEDULA = :cedula
+        "#;
 
-    let mut rows_actual_base = conn.query(sql_centro_actual_base, &[&nacionalidad, &cedula]).map_err(|e| {
-        log::error!("❌ Error query centro actual base: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
+        let mut rows = conn.query(sql_persona, &[&nac_clone, &cedula]).map_err(|e| {
+            log::error!("❌ Error query persona: {}", e);
+            e.to_string()
+        })?;
 
-    if let Some(r_actual_base) = rows_actual_base.next().transpose().map_err(|e| {
-        log::error!("❌ Error leyendo centro actual base: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })? {
-        let codigo_centro_actual_viejo: Option<String> = r_actual_base.get(1).ok();
-        let codigo_centro_actual_nuevo: Option<String> = r_actual_base.get(2).ok();
-        let cod_estado_actual: Option<String> = r_actual_base.get(3).ok();
-        let cod_municipio_actual: Option<String> = r_actual_base.get(4).ok();
-        let cod_parroquia_actual: Option<String> = r_actual_base.get(5).ok();
+        let row_opt = rows.next().transpose().map_err(|e| {
+            log::error!("❌ Error leyendo persona: {}", e);
+            e.to_string()
+        })?;
 
-        resp.codigo_centro_actual = codigo_centro_actual_nuevo
-            .as_deref()
-            .and_then(normalize_codigo_centro_9);
+        let row = match row_opt {
+            Some(r) => r,
+            None => {
+                return Ok(None);
+            }
+        };
 
-        if let (Some(codigo_centro_viejo), Some(ce_str), Some(cm_str), Some(cp_str)) =
-            (codigo_centro_actual_viejo, cod_estado_actual, cod_municipio_actual, cod_parroquia_actual)
-        {
-            let ce_num = ce_str.trim().parse::<i64>().ok();
-            let cm_num = cm_str.trim().parse::<i64>().ok();
-            let cp_num = cp_str.trim().parse::<i64>().ok();
+        resp.primer_apellido = row.get(0).ok();
+        resp.segundo_apellido = row.get(1).ok();
+        resp.primer_nombre = row.get(2).ok();
+        resp.segundo_nombre = row.get(3).ok();
+        let fecha_raw: Option<String> = row.get(4).ok();
+        resp.fecha_nacimiento = fecha_raw.as_deref().and_then(yyyymmdd_to_iso);
+        let cod_obj: Option<i64> = row.get(5).ok();
+        resp.codigo_objecion = cod_obj.map(|x| x.to_string());
+        resp.descripcion_objecion = row.get(6).ok();
 
-            let sql_centro_actual_detalle = r#"
-                SELECT estado.des_estado as nEstado, municipio.des_municipio as nMun,
-                parroquia.des_parroquia as nParr, centro.nombre, centro.direccion
-                FROM estado estado, municipio municipio, parroquia parroquia, centro_votacion centro
-                WHERE parroquia.cod_municipio = municipio.cod_municipio
-                AND parroquia.cod_estado = estado.cod_estado
-                AND municipio.cod_estado = estado.cod_estado
-                AND centro.codigo = :codigo_centro
-                AND centro.estado = parroquia.cod_estado
-                AND centro.distrito = parroquia.cod_municipio
-                AND centro.municipio = parroquia.cod_parroquia
-                AND parroquia.cod_municipio = :cod_municipio
-                AND parroquia.cod_estado = :cod_estado
-                AND parroquia.cod_parroquia = :cod_parroquia
-            "#;
+        let ciudad: Option<String> = row.get(7).ok();
+        let urbanizacion: Option<String> = row.get(8).ok();
+        let sector: Option<String> = row.get(9).ok();
+        let avenida_calle: Option<String> = row.get(10).ok();
+        let edificio_casa: Option<String> = row.get(11).ok();
+        let apartamento: Option<String> = row.get(12).ok();
 
-            let mut rows_actual_detalle = match (ce_num, cm_num, cp_num) {
-                (Some(ce), Some(cm), Some(cp)) => conn
-                    .query(sql_centro_actual_detalle, &[&codigo_centro_viejo, &cm, &ce, &cp])
-                    .map_err(|e| {
-                        log::error!("❌ Error query centro actual detalle: {}", e);
-                        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-                    })?,
-                _ => conn
-                    .query("SELECT 1 FROM dual WHERE 1=0", &[])
-                    .map_err(|e| {
-                        log::error!("❌ Error query dummy detalle actual: {}", e);
-                        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-                    })?,
+        resp.direccion_elector = Some(build_direccion_elector(
+            ciudad, urbanizacion, sector, avenida_calle, edificio_casa, apartamento,
+        ));
+
+        let sql_cuaderno = r#"
+            SELECT nu_mesa, nu_pagina, nu_renglon, nu_edad_al_evento, fe_evento,
+            cod_estado, cod_municipio, cod_parroquia, nu_centro
+            FROM instrumentos.cuaderno_actual2
+            WHERE co_nacionalidad = :nacionalidad AND nu_cedula = :cedula
+        "#;
+
+        let mut rows2 = conn.query(sql_cuaderno, &[&nac_clone, &cedula]).map_err(|e| {
+            log::error!("❌ Error query cuaderno: {}", e);
+            e.to_string()
+        })?;
+
+        let row2_opt = rows2.next().transpose().map_err(|e| {
+            log::error!("❌ Error leyendo cuaderno: {}", e);
+            e.to_string()
+        })?;
+
+        let (cod_estado, cod_municipio, cod_parroquia, cod_centro): (Option<i64>, Option<i64>, Option<i64>, Option<i64>) =
+            if let Some(r2) = row2_opt {
+                resp.numero_mesa = r2.get(0).ok();
+                resp.numero_pagina = r2.get(1).ok();
+                resp.numero_renglon = r2.get(2).ok();
+                resp.edad_ultimo_evento = r2.get(3).ok();
+                let fe: Option<String> = r2.get(4).ok();
+                resp.fecha_ultimo_evento = fe.map(|x| x.chars().take(10).collect());
+                let ce: Option<i64> = r2.get(5).ok();
+                let cm: Option<i64> = r2.get(6).ok();
+                let cp: Option<i64> = r2.get(7).ok();
+                let cc: Option<i64> = r2.get(8).ok();
+                resp.codigo_centro = cc.map(pad9);
+                (ce, cm, cp, cc)
+            } else {
+                (None, None, None, None)
             };
 
-            if let Some(r_actual_detalle) = rows_actual_detalle.next().transpose().map_err(|e| {
-                log::error!("❌ Error leyendo centro actual detalle: {}", e);
-                actix_web::error::ErrorInternalServerError("Error interno del servidor")
-            })? {
-                let des_estado_actual: Option<String> = r_actual_detalle.get(0).ok();
-                let des_municipio_actual: Option<String> = r_actual_detalle.get(1).ok();
-                let des_parroquia_actual: Option<String> = r_actual_detalle.get(2).ok();
-                let nombre_centro_actual: Option<String> = r_actual_detalle.get(3).ok();
-                let direccion_centro_actual: Option<String> = r_actual_detalle.get(4).ok();
+        if let (Some(ce), Some(cm), Some(cp), Some(cc)) = (cod_estado, cod_municipio, cod_parroquia, cod_centro) {
+            let sql_geo = r#"
+                SELECT COD_ESTADO, DES_ESTADO, COD_MUNICIPIO, DES_MUNICIPIO, COD_PARROQUIA,
+                DES_PARROQUIA, CODIGO_NUEVO, NOMBRE, DIRECCION
+                FROM RE.V_CENTRO_VOTACION_GEOGRAFICO
+                WHERE CODIGO_NUEVO = :cc AND COD_ESTADO = :ce AND COD_MUNICIPIO = :cm AND COD_PARROQUIA = :cp
+            "#;
 
-                resp.estado_actual = Some(match ce_num {
-                    Some(v) => fmt_geo(v, des_estado_actual),
-                    None => fmt_geo_sigla("EDO.", des_estado_actual),
-                });
-                resp.municipio_actual = Some(match cm_num {
-                    Some(v) => fmt_geo(v, des_municipio_actual),
-                    None => fmt_geo_sigla("MP.", des_municipio_actual),
-                });
-                resp.parroquia_actual = Some(match cp_num {
-                    Some(v) => fmt_geo(v, des_parroquia_actual),
-                    None => fmt_geo_sigla("PQ.", des_parroquia_actual),
-                });
-                resp.nombre_centro_actual = nombre_centro_actual;
-                resp.direccion_centro_actual = direccion_centro_actual;
+            let mut rows3 = conn.query(sql_geo, &[&cc, &ce, &cm, &cp]).map_err(|e| {
+                log::error!("❌ Error query vista geografica: {}", e);
+                e.to_string()
+            })?;
+
+            if let Some(r3) = rows3.next().transpose().map_err(|e| {
+                log::error!("❌ Error leyendo vista geografica: {}", e);
+                e.to_string()
+            })? {
+                let des_estado: Option<String> = r3.get(1).ok();
+                let des_municipio: Option<String> = r3.get(3).ok();
+                let des_parroquia: Option<String> = r3.get(5).ok();
+                resp.estado = Some(fmt_geo(ce, des_estado));
+                resp.municipio = Some(fmt_geo(cm, des_municipio));
+                resp.parroquia = Some(fmt_geo(cp, des_parroquia));
+                resp.nombre_centro = r3.get(7).ok();
+                resp.direccion_centro = r3.get(8).ok();
             }
         }
-    }
 
-    set_no_aplica_miembro(&mut resp);
+        let sql_centro_actual = r#"
+            SELECT
+                TO_CHAR(ccv.codigo_nuevo) AS codigo_nuevo,
+                cv.estado,
+                e.des_estado,
+                cv.distrito,
+                m.des_municipio,
+                cv.municipio,
+                p.des_parroquia,
+                cv.nombre,
+                cv.direccion
+            FROM AC a
+            JOIN conversion_centro_votacion ccv ON a.centro_votacion = ccv.codigo_actual
+            JOIN centro_votacion cv ON a.centro_votacion = cv.codigo
+            LEFT JOIN estado e ON cv.estado = e.cod_estado
+            LEFT JOIN municipio m ON cv.estado = m.cod_estado AND cv.distrito = m.cod_municipio
+            LEFT JOIN parroquia p ON cv.estado = p.cod_estado AND cv.distrito = p.cod_municipio AND cv.municipio = p.cod_parroquia
+            WHERE a.NACIONALIDAD = :nacionalidad AND a.CEDULA = :cedula
+        "#;
+
+        let mut rows_actual = conn.query(sql_centro_actual, &[&nac_clone, &cedula]).map_err(|e| {
+            log::error!("❌ Error query centro actual consolidado: {}", e);
+            e.to_string()
+        })?;
+
+        if let Some(r_actual) = rows_actual.next().transpose().map_err(|e| {
+            log::error!("❌ Error leyendo centro actual consolidado: {}", e);
+            e.to_string()
+        })? {
+            let codigo_centro_actual_nuevo: Option<String> = r_actual.get(0).ok();
+            let cod_estado_val: Option<i64> = r_actual.get(1).ok();
+            let des_estado_actual: Option<String> = r_actual.get(2).ok();
+            let cod_mun_val: Option<i64> = r_actual.get(3).ok();
+            let des_municipio_actual: Option<String> = r_actual.get(4).ok();
+            let cod_parr_val: Option<i64> = r_actual.get(5).ok();
+            let des_parroquia_actual: Option<String> = r_actual.get(6).ok();
+            let nombre_centro_actual: Option<String> = r_actual.get(7).ok();
+            let direccion_centro_actual: Option<String> = r_actual.get(8).ok();
+
+            resp.codigo_centro_actual = codigo_centro_actual_nuevo
+                .as_deref()
+                .and_then(normalize_codigo_centro_9);
+
+            resp.estado_actual = Some(match cod_estado_val {
+                Some(v) => fmt_geo(v, des_estado_actual),
+                None => fmt_geo_sigla("EDO.", des_estado_actual),
+            });
+            resp.municipio_actual = Some(match cod_mun_val {
+                Some(v) => fmt_geo(v, des_municipio_actual),
+                None => fmt_geo_sigla("MP.", des_municipio_actual),
+            });
+            resp.parroquia_actual = Some(match cod_parr_val {
+                Some(v) => fmt_geo(v, des_parroquia_actual),
+                None => fmt_geo_sigla("PQ.", des_parroquia_actual),
+            });
+            resp.nombre_centro_actual = nombre_centro_actual;
+            resp.direccion_centro_actual = direccion_centro_actual;
+        }
+
+        set_no_aplica_miembro(&mut resp);
+
+        Ok(Some(resp))
+    })
+    .await
+    .map_err(|e| {
+        log::error!("❌ Error en blocking task elector: {}", e);
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
+    })?
+    .map_err(|_| actix_web::error::ErrorInternalServerError("Error interno del servidor"))?;
+
+    let mut resp = match resp_opt {
+        Some(r) => r,
+        None => return Ok(HttpResponse::NotFound().body("Elector no encontrado")),
+    };
 
     let sql_miembro = r#"
     SELECT
@@ -785,6 +770,7 @@ fn normalize_date(input: Option<&str>) -> Option<String> {
 pub async fn get_electores(
     req: HttpRequest,
     query: web::Query<ElectoresQuery>,
+    app_state: web::Data<AppState>,
 ) -> Result<HttpResponse, Error> {
     if let Err(res) = require_consulta_basica(&req) {
         return Ok(res);
@@ -812,12 +798,6 @@ pub async fn get_electores(
     let offset = ((page - 1) * limit) as i64;
     let end_row = offset + fetch_limit as i64;
 
-    let conn = oracle_conn().map_err(|e| {
-        log::error!("❌ Error conectando a Oracle: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-
-    let mut from_where = String::from(" FROM RE.AC_MD_VIEW WHERE 1=1 ");
     let mut binds_str: Vec<(String, String)> = vec![];
     let mut binds_i64: Vec<(String, i64)> = vec![];
 
@@ -825,9 +805,23 @@ pub async fn get_electores(
         s.trim().to_uppercase()
     }
 
+    let has_centro = q.codigo_centro.as_ref().map(|x| !x.trim().is_empty()).unwrap_or(false);
+
+    let (from_clause, mut where_clause) = if has_centro {
+        (
+            "FROM RE.CONVERSION_CENTRO_VOTACION v JOIN RE.AC a ON a.CENTRO_VOTACION = v.CODIGO_ACTUAL",
+            String::from("WHERE 1=1"),
+        )
+    } else {
+        (
+            "FROM RE.AC a LEFT JOIN RE.CONVERSION_CENTRO_VOTACION v ON a.CENTRO_VOTACION = v.CODIGO_ACTUAL",
+            String::from("WHERE 1=1"),
+        )
+    };
+
     if let Some(nac) = q.nacionalidad.as_ref().map(|x| x.trim().to_uppercase()) {
         if nac == "V" || nac == "E" {
-            from_where.push_str(" AND NACIONALIDAD = :nacionalidad ");
+            where_clause.push_str(" AND a.NACIONALIDAD = :nacionalidad ");
             binds_str.push(("nacionalidad".into(), nac));
         }
     }
@@ -836,7 +830,7 @@ pub async fn get_electores(
         if ced <= 0 || ced > 99_999_999 {
             return Err(actix_web::error::ErrorBadRequest("cédula inválida"));
         }
-        from_where.push_str(" AND CEDULA = :cedula ");
+        where_clause.push_str(" AND a.CEDULA = :cedula ");
         binds_i64.push(("cedula".into(), ced));
     }
 
@@ -844,34 +838,34 @@ pub async fn get_electores(
         let iso = normalize_date(Some(fnac_input))
             .ok_or_else(|| actix_web::error::ErrorBadRequest("fecha_nacimiento inválida (use YYYY-MM-DD o YYYYMMDD)"))?;
 
-        from_where.push_str(" AND FECHA_NACIMIENTO LIKE :fecha_nacimiento || '%' ");
+        where_clause.push_str(" AND a.FECHA_NACIMIENTO_4 LIKE :fecha_nacimiento || '%' ");
         binds_str.push(("fecha_nacimiento".into(), iso.replace("-", "")));
     }
 
     if let Some(s) = q.primer_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND PRIMER_NOMBRE LIKE :primer_nombre || '%' ");
+        where_clause.push_str(" AND a.PRIMER_NOMBRE LIKE :primer_nombre || '%' ");
         binds_str.push(("primer_nombre".into(), eq_param(s)));
     }
 
     if let Some(s) = q.segundo_nombre.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND SEGUNDO_NOMBRE LIKE :segundo_nombre || '%' ");
+        where_clause.push_str(" AND a.SEGUNDO_NOMBRE LIKE :segundo_nombre || '%' ");
         binds_str.push(("segundo_nombre".into(), eq_param(s)));
     }
 
     if let Some(s) = q.primer_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND PRIMER_APELLIDO LIKE :primer_apellido || '%' ");
+        where_clause.push_str(" AND a.PRIMER_APELLIDO LIKE :primer_apellido || '%' ");
         binds_str.push(("primer_apellido".into(), eq_param(s)));
     }
 
     if let Some(s) = q.segundo_apellido.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        from_where.push_str(" AND SEGUNDO_APELLIDO LIKE :segundo_apellido || '%' ");
+        where_clause.push_str(" AND a.SEGUNDO_APELLIDO LIKE :segundo_apellido || '%' ");
         binds_str.push(("segundo_apellido".into(), eq_param(s)));
     }
 
     if let Some(s) = q.codigo_centro.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
         match s.parse::<i64>() {
             Ok(codigo) => {
-                from_where.push_str(" AND CODIGO_NUEVO = :codigo_centro ");
+                where_clause.push_str(" AND v.CODIGO_NUEVO = :codigo_centro ");
                 binds_i64.push(("codigo_centro".into(), codigo));
             }
             Err(_) => {
@@ -883,20 +877,16 @@ pub async fn get_electores(
     }
 
     if let Some(s) = q.global.as_ref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-        let g = format!("%{}%", s.trim().to_uppercase());
-        from_where.push_str(
-            " AND (
-                NACIONALIDAD LIKE :global
-                OR TO_CHAR(CEDULA) LIKE :global
-                OR PRIMER_NOMBRE LIKE :global
-                OR SEGUNDO_NOMBRE LIKE :global
-                OR PRIMER_APELLIDO LIKE :global
-                OR SEGUNDO_APELLIDO LIKE :global
-                OR FECHA_NACIMIENTO LIKE :global
-                OR TO_CHAR(CODIGO_NUEVO) LIKE :global
-            ) ",
-        );
-        binds_str.push(("global".into(), g));
+        if let Ok(num) = s.parse::<i64>() {
+            where_clause.push_str(" AND (a.CEDULA = :global_ced OR v.CODIGO_NUEVO = :global_centro) ");
+            binds_i64.push(("global_ced".into(), num));
+            binds_i64.push(("global_centro".into(), num));
+        } else {
+            let term = eq_param(s);
+            where_clause.push_str(" AND (a.PRIMER_NOMBRE LIKE :global_nombre || '%' OR a.PRIMER_APELLIDO LIKE :global_apellido || '%') ");
+            binds_str.push(("global_nombre".into(), term.clone()));
+            binds_str.push(("global_apellido".into(), term));
+        }
     }
 
     let sql_select = format!(
@@ -906,94 +896,111 @@ pub async fn get_electores(
             SELECT t_inner.*, ROWNUM rn
             FROM (
                 SELECT
-                    NACIONALIDAD,
-                    CEDULA,
-                    PRIMER_NOMBRE,
-                    SEGUNDO_NOMBRE,
-                    PRIMER_APELLIDO,
-                    SEGUNDO_APELLIDO,
-                    FECHA_NACIMIENTO,
-                    CODIGO_NUEVO AS CODIGO_CENTRO_VOTACION
+                    a.NACIONALIDAD,
+                    a.CEDULA,
+                    a.PRIMER_NOMBRE,
+                    a.SEGUNDO_NOMBRE,
+                    a.PRIMER_APELLIDO,
+                    a.SEGUNDO_APELLIDO,
+                    a.FECHA_NACIMIENTO_4 AS FECHA_NACIMIENTO,
+                    TO_CHAR(v.CODIGO_NUEVO) AS CODIGO_CENTRO_VOTACION
                 {}
-                ORDER BY CEDULA
+                {}
+                ORDER BY a.CEDULA
             ) t_inner
             WHERE ROWNUM <= :end_row
         )
         WHERE rn > :offset
         "#,
-        from_where
+        from_clause, where_clause
     );
 
-    let offset_holder = offset;
-    let end_row_holder = end_row;
+    let pool_oracle = app_state.pool_oracle.clone();
+    let (items, has_more) = web::block(move || -> Result<(Vec<ElectorListaItem>, bool), String> {
+        let conn = pool_oracle.get().map_err(|e| {
+            log::error!("❌ Error obteniendo conexión de Oracle Pool: {}", e);
+            e.to_string()
+        })?;
 
-    let mut select_params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
+        let offset_holder = offset;
+        let end_row_holder = end_row;
 
-    for (k, v) in &binds_str {
-        select_params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
-    }
-    for (k, v) in &binds_i64 {
-        select_params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
-    }
-    select_params.push(("end_row", &end_row_holder as &dyn oracle::sql_type::ToSql));
-    select_params.push(("offset", &offset_holder as &dyn oracle::sql_type::ToSql));
+        let mut select_params: Vec<(&str, &dyn oracle::sql_type::ToSql)> = Vec::new();
 
-    let t_select = Instant::now();
-    let mut rows_data = conn.query_named(&sql_select, &select_params).map_err(|e| {
-        log::error!("❌ Error en SELECT de electores: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-    log::info!("⏱️ get_electores SELECT ms = {}", t_select.elapsed().as_millis());
+        for (k, v) in &binds_str {
+            select_params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
+        }
+        for (k, v) in &binds_i64 {
+            select_params.push((k.as_str(), v as &dyn oracle::sql_type::ToSql));
+        }
+        select_params.push(("end_row", &end_row_holder as &dyn oracle::sql_type::ToSql));
+        select_params.push(("offset", &offset_holder as &dyn oracle::sql_type::ToSql));
 
-    let t_fetch = Instant::now();
-    let mut items: Vec<ElectorListaItem> = Vec::new();
+        let t_select = Instant::now();
+        let mut rows_data = conn.query_named(&sql_select, &select_params).map_err(|e| {
+            log::error!("❌ Error en SELECT de electores: {}", e);
+            e.to_string()
+        })?;
+        log::info!("⏱️ get_electores SELECT ms = {}", t_select.elapsed().as_millis());
 
-    while let Some(row) = rows_data.next().transpose().map_err(|e| {
-        log::error!("❌ Error leyendo filas: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })? {
-        let nac: String = row.get(0).unwrap_or_else(|_| "V".to_string());
-        let ced: i64 = row.get(1).unwrap_or(0);
-        let primer_nombre: Option<String> = row.get(2).ok();
-        let segundo_nombre: Option<String> = row.get(3).ok();
-        let primer_apellido: Option<String> = row.get(4).ok();
-        let segundo_apellido: Option<String> = row.get(5).ok();
-        let fecha_raw: Option<String> = row.get(6).ok();
+        let t_fetch = Instant::now();
+        let mut items: Vec<ElectorListaItem> = Vec::new();
 
-        let fecha_iso = if let Some(f) = fecha_raw {
-            if f.len() >= 8 {
-                Some(format!("{}-{}-{}", &f[0..4], &f[4..6], &f[6..8]))
+        while let Some(row) = rows_data.next().transpose().map_err(|e| {
+            log::error!("❌ Error leyendo filas: {}", e);
+            e.to_string()
+        })? {
+            let nac: String = row.get(0).unwrap_or_else(|_| "V".to_string());
+            let ced: i64 = row.get(1).unwrap_or(0);
+            let primer_nombre: Option<String> = row.get(2).ok();
+            let segundo_nombre: Option<String> = row.get(3).ok();
+            let primer_apellido: Option<String> = row.get(4).ok();
+            let segundo_apellido: Option<String> = row.get(5).ok();
+            let fecha_raw: Option<String> = row.get(6).ok();
+
+            let fecha_iso = if let Some(f) = fecha_raw {
+                if f.len() >= 8 {
+                    Some(format!("{}-{}-{}", &f[0..4], &f[4..6], &f[6..8]))
+                } else {
+                    Some(f)
+                }
             } else {
-                Some(f)
-            }
-        } else {
-            None
-        };
+                None
+            };
 
-        let codigo_centro: Option<String> = row.get(7).ok();
+            let codigo_centro: Option<String> = row.get(7).ok();
 
-        items.push(ElectorListaItem {
-            nacionalidad: nac,
-            cedula: ced,
-            fecha_nacimiento: fecha_iso,
-            primer_nombre,
-            segundo_nombre,
-            primer_apellido,
-            segundo_apellido,
-            codigo_centro,
-        });
-    }
+            items.push(ElectorListaItem {
+                nacionalidad: nac,
+                cedula: ced,
+                fecha_nacimiento: fecha_iso,
+                primer_nombre,
+                segundo_nombre,
+                primer_apellido,
+                segundo_apellido,
+                codigo_centro,
+            });
+        }
 
-    let has_more = items.len() as u32 > limit;
-    if has_more {
-        items.truncate(limit as usize);
-    }
+        let has_more = items.len() as u32 > limit;
+        if has_more {
+            items.truncate(limit as usize);
+        }
 
-    log::info!(
-        "⏱️ get_electores FETCH rows={} ms = {}",
-        items.len(),
-        t_fetch.elapsed().as_millis()
-    );
+        log::info!(
+            "⏱️ get_electores FETCH rows={} ms = {}",
+            items.len(),
+            t_fetch.elapsed().as_millis()
+        );
+
+        Ok((items, has_more))
+    })
+    .await
+    .map_err(|e| {
+        log::error!("❌ Error en blocking task get_electores: {}", e);
+        actix_web::error::ErrorInternalServerError("Error interno del servidor")
+    })?
+    .map_err(|_| actix_web::error::ErrorInternalServerError("Error interno del servidor"))?;
 
     Ok(HttpResponse::Ok().json(ElectoresPagedResponse {
         items,
@@ -1071,108 +1078,90 @@ pub async fn get_votos_emitir(
         return Err(actix_web::error::ErrorBadRequest("cedula inválida"));
     }
 
-    let conn = oracle_conn().map_err(|e| {
-        log::error!("❌ Error conectando a Oracle: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
+    let pool_oracle = app_state.pool_oracle.clone();
+    let nac_clone = nacionalidad.clone();
 
-    let sql_geo = r#"
-        SELECT a.centro_votacion, ccv.codigo_nuevo, cv.estado, cv.distrito, cv.municipio
-        FROM AC a, CENTRO_VOTACION cv, conversion_centro_votacion ccv
-        WHERE a.NACIONALIDAD = :nac AND a.CEDULA = :ced AND a.centro_votacion = cv.codigo
-        AND a.centro_votacion = ccv.codigo_actual
-    "#;
-
-    let mut rows_geo = conn.query(sql_geo, &[&nacionalidad, &cedula]).map_err(|e| {
-        log::error!("❌ Error geo query: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-
-    let row_geo_opt = rows_geo.next().transpose().map_err(|e| {
-        log::error!("❌ Error leyendo geo: {}", e);
-        actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-
-    let row_geo = match row_geo_opt {
-        Some(r) => r,
-        None => {
-            return Ok(HttpResponse::Ok().json(VotosEmitirResponse::default()));
-        }
-    };
-
-    let cod_estado: i64 =
-        parse_i32_opt(row_geo.get::<usize, Option<String>>(2).ok().flatten()) as i64;
-    let cod_municipio: i64 =
-        parse_i32_opt(row_geo.get::<usize, Option<String>>(3).ok().flatten()) as i64;
-    let cod_parroq: i64 =
-        parse_i32_opt(row_geo.get::<usize, Option<String>>(4).ok().flatten()) as i64;
-
-    if cod_estado == 0 || cod_municipio == 0 || cod_parroq == 0 {
-        return Ok(HttpResponse::Ok().json(VotosEmitirResponse::default()));
-    }
-
-    let sql_votos = r#"
-        SELECT CIRC_CONCEJ, CIRC_ASAMB_LEG, PRESIDENTE, DIP_NOM_ASAMB_NAC, DIP_LIS_ASAMB_NAC,
-        DIP_IND_SAMB_NAC, DIP_PARLAM_ANDINO, DIP_PARLAM_LAT_AMER, GOBERNADOR,
-        DIP_CONC_LEG_NOM, DIP_CONC_LEG_LIS, REP_IND_CONC_LEG, ALCALD_METROPOL,
-        CONC_CAB_METROP_NOM, CONC_CAB_METROP_LIS, ALCALDE_DISTRITAL, CONC_CAB_DIST_NOM,
-        CONC_CAB_DIST_LIS, REP_IND_CAB_DIST, ALCALDE_MUNICIPAL, CONC_MUNIC_NOM,
-        CONC_MUNIC_LIS, REP_IND_CONC_MUNIC, JUNTA_PARRQ_NOM, JUNTA_PARRQ_LIS, REFERENDOS
-        FROM MC.VOTOS_EMITIR
-        WHERE cod_estado = :cod_estado AND cod_municipio = :cod_municipio AND cod_parroq = :cod_parroq
-    "#;
-
-    let mut rows_v = conn
-        .query(sql_votos, &[&cod_estado, &cod_municipio, &cod_parroq])
-        .map_err(|e| {
-            log::error!("❌ Error votos query: {}", e);
-            actix_web::error::ErrorInternalServerError("Error interno del servidor")
+    let resp = web::block(move || -> Result<VotosEmitirResponse, String> {
+        let conn = pool_oracle.get().map_err(|e| {
+            log::error!("❌ Error obteniendo conexión de Oracle Pool: {}", e);
+            e.to_string()
         })?;
 
-    let row_v_opt = rows_v.next().transpose().map_err(|e| {
-        log::error!("❌ Error leyendo votos: {}", e);
+        let sql_votos = r#"
+            SELECT 
+                ve.CIRC_CONCEJ, ve.CIRC_ASAMB_LEG, ve.PRESIDENTE, ve.DIP_NOM_ASAMB_NAC, ve.DIP_LIS_ASAMB_NAC,
+                ve.DIP_IND_SAMB_NAC, ve.DIP_PARLAM_ANDINO, ve.DIP_PARLAM_LAT_AMER, ve.GOBERNADOR,
+                ve.DIP_CONC_LEG_NOM, ve.DIP_CONC_LEG_LIS, ve.REP_IND_CONC_LEG, ve.ALCALD_METROPOL,
+                ve.CONC_CAB_METROP_NOM, ve.CONC_CAB_METROP_LIS, ve.ALCALDE_DISTRITAL, ve.CONC_CAB_DIST_NOM,
+                ve.CONC_CAB_DIST_LIS, ve.REP_IND_CAB_DIST, ve.ALCALDE_MUNICIPAL, ve.CONC_MUNIC_NOM,
+                ve.CONC_MUNIC_LIS, ve.REP_IND_CONC_MUNIC, ve.JUNTA_PARRQ_NOM, ve.JUNTA_PARRQ_LIS, ve.REFERENDOS
+            FROM RE.AC a
+            JOIN RE.CENTRO_VOTACION cv ON a.CENTRO_VOTACION = cv.CODIGO
+            JOIN MC.VOTOS_EMITIR ve 
+              ON TO_NUMBER(cv.ESTADO) = ve.COD_ESTADO 
+             AND TO_NUMBER(cv.DISTRITO) = ve.COD_MUNICIPIO 
+             AND TO_NUMBER(cv.MUNICIPIO) = ve.COD_PARROQ
+            WHERE a.NACIONALIDAD = :nac AND a.CEDULA = :ced
+        "#;
+
+        let mut rows_v = conn
+            .query(sql_votos, &[&nac_clone, &cedula])
+            .map_err(|e| {
+                log::error!("❌ Error votos query consolidado: {}", e);
+                e.to_string()
+            })?;
+
+        let row_v_opt = rows_v.next().transpose().map_err(|e| {
+            log::error!("❌ Error leyendo votos: {}", e);
+            e.to_string()
+        })?;
+
+        let r = match row_v_opt {
+            Some(x) => x,
+            None => {
+                return Ok(VotosEmitirResponse::default());
+            }
+        };
+
+        let get_s = |idx: usize| -> i32 {
+            parse_i32_opt(r.get::<usize, Option<String>>(idx).ok().flatten())
+        };
+
+        Ok(VotosEmitirResponse {
+            circ_consejo_nom: get_s(0),
+            circ_asamblea_leg: get_s(1),
+            presidente: get_s(2),
+            diputado_nom_asamb_nac: get_s(3),
+            diputado_lista_asamb_nac: get_s(4),
+            diputado_ind_asamb_nac: get_s(5),
+            diputados_parlamento_andino: get_s(6),
+            diputados_parlam_lat_ame: get_s(7),
+            gobernador: get_s(8),
+            diputados_consejo_leg_nom: get_s(9),
+            diputados_consejo_leg_list: get_s(10),
+            representante_consejo_leg: get_s(11),
+            alcalde_metropolitano: get_s(12),
+            concejal_cabildo_metrop_nom: get_s(13),
+            concejal_cabildo_metrop_list: get_s(14),
+            alcalde_distrital: get_s(15),
+            concejal_cabildo_dist_nom: get_s(16),
+            concejal_cabildo_dist_lista: get_s(17),
+            repres_ind_cabildo_dist: get_s(18),
+            alcalde_municipal: get_s(19),
+            concejal_municipal_nom: get_s(20),
+            concejal_municipal_lista: get_s(21),
+            repres_ind_concejal_mun: get_s(22),
+            junta_parroquial_nominal: get_s(23),
+            junta_parroquial_lista: get_s(24),
+            referendos: get_s(25),
+        })
+    })
+    .await
+    .map_err(|e| {
+        log::error!("❌ Error en blocking task votos: {}", e);
         actix_web::error::ErrorInternalServerError("Error interno del servidor")
-    })?;
-
-    let r = match row_v_opt {
-        Some(x) => x,
-        None => {
-            return Ok(HttpResponse::Ok().json(VotosEmitirResponse::default()));
-        }
-    };
-
-    let get_s = |idx: usize| -> i32 {
-        parse_i32_opt(r.get::<usize, Option<String>>(idx).ok().flatten())
-    };
-
-    let resp = VotosEmitirResponse {
-        circ_consejo_nom: get_s(0),
-        circ_asamblea_leg: get_s(1),
-        presidente: get_s(2),
-        diputado_nom_asamb_nac: get_s(3),
-        diputado_lista_asamb_nac: get_s(4),
-        diputado_ind_asamb_nac: get_s(5),
-        diputados_parlamento_andino: get_s(6),
-        diputados_parlam_lat_ame: get_s(7),
-        gobernador: get_s(8),
-        diputados_consejo_leg_nom: get_s(9),
-        diputados_consejo_leg_list: get_s(10),
-        representante_consejo_leg: get_s(11),
-        alcalde_metropolitano: get_s(12),
-        concejal_cabildo_metrop_nom: get_s(13),
-        concejal_cabildo_metrop_list: get_s(14),
-        alcalde_distrital: get_s(15),
-        concejal_cabildo_dist_nom: get_s(16),
-        concejal_cabildo_dist_lista: get_s(17),
-        repres_ind_cabildo_dist: get_s(18),
-        alcalde_municipal: get_s(19),
-        concejal_municipal_nom: get_s(20),
-        concejal_municipal_lista: get_s(21),
-        repres_ind_concejal_mun: get_s(22),
-        junta_parroquial_nominal: get_s(23),
-        junta_parroquial_lista: get_s(24),
-        referendos: get_s(25),
-    };
+    })?
+    .map_err(|_| actix_web::error::ErrorInternalServerError("Error interno del servidor"))?;
 
     if let Some(autor_id) = get_autor_id(&req) {
         let ip_origen = extract_ip(&req);

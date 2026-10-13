@@ -33,7 +33,9 @@ pub async fn get_security_dashboard(
     let now = Utc::now();
     let since = now - Duration::hours(24);
 
-    let stats_result = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+    let pool = &app_state.pool_pg;
+
+    let stats_future = sqlx::query_as::<_, (i64, i64, i64, i64)>(
         r#"
         SELECT 
             COUNT(*)::bigint,
@@ -46,15 +48,9 @@ pub async fn get_security_dashboard(
         "#,
     )
     .bind(since)
-    .fetch_one(&app_state.pool_pg)
-    .await;
+    .fetch_one(pool);
 
-    let (total, exitosos, fallidos, alertas) = match stats_result {
-        Ok(row) => row,
-        Err(_) => (0, 0, 0, 0),
-    };
-
-    let actividad = sqlx::query_as::<_, HourlyActivity>(
+    let actividad_future = sqlx::query_as::<_, HourlyActivity>(
         r#"
         SELECT 
             TO_CHAR(created_at, 'HH24:00') as hora,
@@ -68,11 +64,9 @@ pub async fn get_security_dashboard(
         "#,
     )
     .bind(since)
-    .fetch_all(&app_state.pool_pg)
-    .await
-    .unwrap_or_default();
+    .fetch_all(pool);
 
-    let top_ips = sqlx::query_as::<_, IpActivity>(
+    let top_ips_future = sqlx::query_as::<_, IpActivity>(
         r#"
         SELECT 
             ip_origen as ip,
@@ -87,51 +81,31 @@ pub async fn get_security_dashboard(
         "#,
     )
     .bind(since)
-    .fetch_all(&app_state.pool_pg)
-    .await
-    .unwrap_or_default();
+    .fetch_all(pool);
 
-    let honeypot_count = sqlx::query_scalar::<_, i64>(
+    let eventos_tipo4_future = sqlx::query_as::<_, (i64, i64, i64)>(
         r#"
-        SELECT COUNT(*) 
+        SELECT 
+            COUNT(*) FILTER (WHERE id_accion = 15)::bigint,
+            COUNT(*) FILTER (WHERE id_accion = 17)::bigint,
+            COUNT(*) FILTER (WHERE id_accion = 16)::bigint
         FROM logs 
         WHERE created_at >= $1 
-            AND id_tipo_accion = 4 
-            AND id_accion = 15
+            AND id_tipo_accion = 4
         "#,
     )
     .bind(since)
-    .fetch_one(&app_state.pool_pg)
-    .await
-    .unwrap_or(0);
+    .fetch_one(pool);
 
-    let rate_limit_count = sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COUNT(*) 
-        FROM logs 
-        WHERE created_at >= $1 
-            AND id_tipo_accion = 4 
-            AND id_accion = 17
-        "#,
-    )
-    .bind(since)
-    .fetch_one(&app_state.pool_pg)
-    .await
-    .unwrap_or(0);
+    // ✅ Ejecutar todas las consultas en paralelo
+    let (stats_result, actividad_result, top_ips_result, eventos_tipo4_result) =
+        tokio::join!(stats_future, actividad_future, top_ips_future, eventos_tipo4_future);
 
-    let captcha_invalid_count = sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COUNT(*) 
-        FROM logs 
-        WHERE created_at >= $1 
-            AND id_tipo_accion = 4 
-            AND id_accion = 16
-        "#,
-    )
-    .bind(since)
-    .fetch_one(&app_state.pool_pg)
-    .await
-    .unwrap_or(0);
+    let (total, exitosos, fallidos, alertas) = stats_result.unwrap_or((0, 0, 0, 0));
+    let actividad = actividad_result.unwrap_or_default();
+    let top_ips = top_ips_result.unwrap_or_default();
+    let (honeypot_count, rate_limit_count, captcha_invalid_count) =
+        eventos_tipo4_result.unwrap_or((0, 0, 0));
 
     let response = serde_json::json!({
         "total_logins_24h": total,

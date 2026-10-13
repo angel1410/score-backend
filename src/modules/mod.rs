@@ -8,9 +8,13 @@ pub mod logs;
 pub mod parametros;
 pub mod security;
 pub mod exportacion;  // ✅ Módulo consolidado de exportación/verificación
+pub mod health;       // ✅ Módulo de monitoreo y health check profundo
 
-// ✅ Login
-pub use login::{get_login, get_logout, get_captcha};
+// ✅ Login & Sesión
+pub use login::{get_login, get_logout, get_captcha, refresh_token};
+
+// ✅ Monitoreo y Salud
+pub use health::get_health_status;
 
 // ✅ Registro Electoral (RE)
 pub use re::{get_movimientos_re, get_elector, get_electores, get_votos_emitir};
@@ -46,6 +50,7 @@ pub use parametros::{
     actualizar_parametro,
     eliminar_parametro,
     get_fecha_cierre,
+    get_version_sistema,
 };
 
 // ✅ Exportación y Verificación de documentos (CONSOLIDADO)
