@@ -1,6 +1,6 @@
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use chrono::{Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
 use crate::middleware::auth::is_sistemas;
@@ -11,6 +11,7 @@ pub struct IpActivity {
     pub ip: String,
     pub intentos: i64,
     pub ultimo_intento: chrono::NaiveDateTime,
+    pub eventos: Option<String>,
 }
 
 #[derive(Serialize, FromRow, Debug)]
@@ -18,6 +19,21 @@ pub struct HourlyActivity {
     pub hora: String,
     pub exitosos: i64,
     pub fallidos: i64,
+}
+
+#[derive(Serialize, FromRow, Debug, Clone)]
+pub struct CapsuleIpDetail {
+    pub ip: String,
+    pub intentos: i64,
+    pub ultimo_intento: chrono::NaiveDateTime,
+    pub eventos: Option<String>,
+    pub cedulas: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CapsulaIpsQuery {
+    pub categoria: String,
 }
 
 pub async fn get_security_dashboard(
@@ -38,13 +54,12 @@ pub async fn get_security_dashboard(
     let stats_future = sqlx::query_as::<_, (i64, i64, i64, i64)>(
         r#"
         SELECT 
-            COUNT(*)::bigint,
-            COUNT(*) FILTER (WHERE accion = 'INICIO DE SESIÓN')::bigint,
-            COUNT(*) FILTER (WHERE accion != 'INICIO DE SESIÓN')::bigint,
-            0::bigint
+            COUNT(*) FILTER (WHERE id_tipo_accion = 1)::bigint,
+            COUNT(*) FILTER (WHERE id_tipo_accion = 1 AND accion = 'INICIO DE SESIÓN')::bigint,
+            COUNT(*) FILTER (WHERE id_tipo_accion = 1 AND accion != 'INICIO DE SESIÓN')::bigint,
+            COUNT(*) FILTER (WHERE (id_tipo_accion = 4 AND id_accion IN (15, 17)) OR id_accion = 6)::bigint
         FROM logs 
-        WHERE created_at >= $1 
-            AND id_tipo_accion = 1
+        WHERE created_at >= $1
         "#,
     )
     .bind(since)
@@ -71,10 +86,11 @@ pub async fn get_security_dashboard(
         SELECT 
             ip_origen as ip,
             COUNT(*)::bigint as intentos,
-            MAX(created_at) as ultimo_intento
+            MAX(created_at) as ultimo_intento,
+            STRING_AGG(DISTINCT accion, ', ') as eventos
         FROM logs 
         WHERE created_at >= $1 
-            AND id_tipo_accion = 1
+            AND (id_tipo_accion IN (1, 4) OR id_accion = 6)
         GROUP BY ip_origen 
         ORDER BY intentos DESC 
         LIMIT 10
@@ -121,11 +137,101 @@ pub async fn get_security_dashboard(
     });
 
     log::info!(
-        "📊 Dashboard seguridad: total={}, exitosos={}, fallidos={}",
+        "📊 Dashboard seguridad: total={}, exitosos={}, fallidos={}, alertas={}",
         total,
         exitosos,
-        fallidos
+        fallidos,
+        alertas
     );
 
     HttpResponse::Ok().json(response)
+}
+
+/// Obtiene el detalle de IPs asociadas a una cápsula específica del dashboard
+pub async fn get_capsula_ips(
+    req: HttpRequest,
+    query: web::Query<CapsulaIpsQuery>,
+    app_state: web::Data<AppState>,
+) -> impl Responder {
+    if !is_sistemas(&req) {
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "error": "No tiene permisos para realizar esta acción"
+        }));
+    }
+
+    let now = Utc::now();
+    let since = now - Duration::hours(24);
+    let pool = &app_state.pool_pg;
+
+    let (filter_clause, titulo) = match query.categoria.as_str() {
+        "total_logins" => ("id_tipo_accion = 1", "Total Logins (24h)"),
+        "logins_exitosos" => (
+            "id_tipo_accion = 1 AND accion = 'INICIO DE SESIÓN'",
+            "Logins Exitosos",
+        ),
+        "logins_fallidos" => (
+            "id_tipo_accion = 1 AND accion != 'INICIO DE SESIÓN'",
+            "Logins Fallidos",
+        ),
+        "alertas_criticas" => (
+            "(id_tipo_accion = 4 AND id_accion IN (15, 17)) OR id_accion = 6",
+            "Alertas Críticas y Bloqueos",
+        ),
+        "honeypot" => (
+            "id_tipo_accion = 4 AND id_accion = 15",
+            "Honeypot Activado (Trampa de Bots)",
+        ),
+        "rate_limit" => (
+            "id_tipo_accion = 4 AND id_accion = 17",
+            "Rate Limit Excedido",
+        ),
+        "captcha_invalid" => (
+            "id_tipo_accion = 4 AND id_accion = 16",
+            "CAPTCHA Inválido",
+        ),
+        _ => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "Categoría de cápsula inválida"
+            }));
+        }
+    };
+
+    let sql = format!(
+        r#"
+        SELECT 
+            ip_origen as ip,
+            COUNT(*)::bigint as intentos,
+            MAX(created_at) as ultimo_intento,
+            STRING_AGG(DISTINCT accion, ', ') as eventos,
+            STRING_AGG(DISTINCT cedula_relacionada::text, ', ') FILTER (WHERE cedula_relacionada IS NOT NULL) as cedulas,
+            MAX(user_agent) as user_agent
+        FROM logs 
+        WHERE created_at >= $1 AND {}
+        GROUP BY ip_origen 
+        ORDER BY intentos DESC, ultimo_intento DESC 
+        LIMIT 100
+        "#,
+        filter_clause
+    );
+
+    match sqlx::query_as::<_, CapsuleIpDetail>(&sql)
+        .bind(since)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(ips) => HttpResponse::Ok().json(serde_json::json!({
+            "categoria": query.categoria,
+            "titulo": titulo,
+            "total_ips": ips.len(),
+            "ips": ips,
+            "timestamp": now,
+        })),
+        Err(e) => {
+            log::error!("Error consultando IPs de cápsula {}: {}", query.categoria, e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Error consultando detalle de IPs",
+                "details": e.to_string()
+            }))
+        }
+    }
 }

@@ -145,7 +145,10 @@ pub async fn get_login(
 
     // 🍯 1. HONEYPOT
     if let Some(honeypot_value) = &info.honeypot {
-        if !honeypot_value.is_empty() {
+        let hp_trimmed = honeypot_value.trim();
+        let cedula_str = cedula.to_string();
+        // Solo bloquea si tiene contenido y NO es un duplicado accidental por autofill del navegador
+        if !hp_trimmed.is_empty() && hp_trimmed != cedula_str && hp_trimmed != password.trim() {
             let client_ip = extract_ip(&req);
 
             let log_entry = LogEntry {

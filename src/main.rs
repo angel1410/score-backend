@@ -255,6 +255,10 @@ async fn main() -> std::io::Result<()> {
                                 web::get().to(modules::security::get_security_dashboard),
                             )
                             .route(
+                                "/security/capsula-ips",
+                                web::get().to(modules::security::get_capsula_ips),
+                            )
+                            .route(
                                 "/exportar/reporte",
                                 web::post().to(modules::exportacion::registrar_exportacion),
                             ),

@@ -806,18 +806,10 @@ pub async fn get_electores(
     }
 
     let has_centro = q.codigo_centro.as_ref().map(|x| !x.trim().is_empty()).unwrap_or(false);
+    let global_is_num = q.global.as_ref().map(|x| x.trim().parse::<i64>().is_ok()).unwrap_or(false);
+    let needs_centro_in_filter = has_centro || global_is_num;
 
-    let (from_clause, mut where_clause) = if has_centro {
-        (
-            "FROM RE.CONVERSION_CENTRO_VOTACION v JOIN RE.AC a ON a.CENTRO_VOTACION = v.CODIGO_ACTUAL",
-            String::from("WHERE 1=1"),
-        )
-    } else {
-        (
-            "FROM RE.AC a LEFT JOIN RE.CONVERSION_CENTRO_VOTACION v ON a.CENTRO_VOTACION = v.CODIGO_ACTUAL",
-            String::from("WHERE 1=1"),
-        )
-    };
+    let mut where_clause = String::from("WHERE 1=1");
 
     if let Some(nac) = q.nacionalidad.as_ref().map(|x| x.trim().to_uppercase()) {
         if nac == "V" || nac == "E" {
@@ -889,31 +881,78 @@ pub async fn get_electores(
         }
     }
 
-    let sql_select = format!(
-        r#"
-        SELECT *
-        FROM (
-            SELECT t_inner.*, ROWNUM rn
+    // ✅ Optimización de consulta:
+    // Si la búsqueda no filtra por centro de votación, aplicamos Deferred Join:
+    // Paginamos y filtramos en RE.AC (21M registros) primero, y unimos a CONVERSION_CENTRO_VOTACION
+    // únicamente para los 8 registros de la página final, reduciendo dramáticamente el costo de I/O.
+    let sql_select = if needs_centro_in_filter {
+        format!(
+            r#"
+            SELECT /*+ FIRST_ROWS(10) */
+                p.NACIONALIDAD,
+                p.CEDULA,
+                p.PRIMER_NOMBRE,
+                p.SEGUNDO_NOMBRE,
+                p.PRIMER_APELLIDO,
+                p.SEGUNDO_APELLIDO,
+                p.FECHA_NACIMIENTO,
+                p.CODIGO_CENTRO_VOTACION
             FROM (
-                SELECT
-                    a.NACIONALIDAD,
-                    a.CEDULA,
-                    a.PRIMER_NOMBRE,
-                    a.SEGUNDO_NOMBRE,
-                    a.PRIMER_APELLIDO,
-                    a.SEGUNDO_APELLIDO,
-                    a.FECHA_NACIMIENTO_4 AS FECHA_NACIMIENTO,
-                    TO_CHAR(v.CODIGO_NUEVO) AS CODIGO_CENTRO_VOTACION
-                {}
-                {}
-                ORDER BY a.CEDULA
-            ) t_inner
-            WHERE ROWNUM <= :end_row
+                SELECT t_inner.*, ROWNUM rn
+                FROM (
+                    SELECT /*+ FIRST_ROWS(10) */
+                        a.NACIONALIDAD,
+                        a.CEDULA,
+                        a.PRIMER_NOMBRE,
+                        a.SEGUNDO_NOMBRE,
+                        a.PRIMER_APELLIDO,
+                        a.SEGUNDO_APELLIDO,
+                        a.FECHA_NACIMIENTO_4 AS FECHA_NACIMIENTO,
+                        TO_CHAR(v.CODIGO_NUEVO) AS CODIGO_CENTRO_VOTACION
+                    FROM RE.CONVERSION_CENTRO_VOTACION v JOIN RE.AC a ON a.CENTRO_VOTACION = v.CODIGO_ACTUAL
+                    {}
+                ) t_inner
+                WHERE ROWNUM <= :end_row
+            ) p
+            WHERE p.rn > :offset
+            "#,
+            where_clause
         )
-        WHERE rn > :offset
-        "#,
-        from_clause, where_clause
-    );
+    } else {
+        format!(
+            r#"
+            SELECT /*+ FIRST_ROWS(10) */
+                p.NACIONALIDAD,
+                p.CEDULA,
+                p.PRIMER_NOMBRE,
+                p.SEGUNDO_NOMBRE,
+                p.PRIMER_APELLIDO,
+                p.SEGUNDO_APELLIDO,
+                p.FECHA_NACIMIENTO,
+                TO_CHAR(v.CODIGO_NUEVO) AS CODIGO_CENTRO_VOTACION
+            FROM (
+                SELECT t_inner.*, ROWNUM rn
+                FROM (
+                    SELECT /*+ FIRST_ROWS(10) */
+                        a.NACIONALIDAD,
+                        a.CEDULA,
+                        a.PRIMER_NOMBRE,
+                        a.SEGUNDO_NOMBRE,
+                        a.PRIMER_APELLIDO,
+                        a.SEGUNDO_APELLIDO,
+                        a.FECHA_NACIMIENTO_4 AS FECHA_NACIMIENTO,
+                        a.CENTRO_VOTACION
+                    FROM RE.AC a
+                    {}
+                ) t_inner
+                WHERE ROWNUM <= :end_row
+            ) p
+            LEFT JOIN RE.CONVERSION_CENTRO_VOTACION v ON p.CENTRO_VOTACION = v.CODIGO_ACTUAL
+            WHERE p.rn > :offset
+            "#,
+            where_clause
+        )
+    };
 
     let pool_oracle = app_state.pool_oracle.clone();
     let (items, has_more) = web::block(move || -> Result<(Vec<ElectorListaItem>, bool), String> {
