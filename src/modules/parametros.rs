@@ -38,13 +38,24 @@ pub struct ParametroUpdate {
 
 // ✅ CRUD
 pub async fn get_parametros(app_state: web::Data<AppState>) -> impl Responder {
+    if let Some(cached) = app_state.get_cached("parametros_all") {
+        return HttpResponse::Ok()
+            .content_type("application/json")
+            .body(cached);
+    }
+
     match sqlx::query_as::<_, Parametro>(
         "SELECT * FROM parametros ORDER BY nombre_parametro ASC"
     )
     .fetch_all(&app_state.pool_pg)
     .await
     {
-        Ok(parametros) => HttpResponse::Ok().json(parametros),
+        Ok(parametros) => {
+            if let Ok(json_str) = serde_json::to_string(&parametros) {
+                app_state.set_cached("parametros_all", json_str, 60);
+            }
+            HttpResponse::Ok().json(parametros)
+        }
         Err(e) => {
             log::error!("Error obteniendo parámetros: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({
@@ -60,7 +71,14 @@ pub async fn get_parametro_by_nombre(
     path: web::Path<String>,
 ) -> impl Responder {
     let nombre = path.into_inner();
-    
+    let cache_key = format!("parametro_{}", nombre);
+
+    if let Some(cached) = app_state.get_cached(&cache_key) {
+        return HttpResponse::Ok()
+            .content_type("application/json")
+            .body(cached);
+    }
+
     match sqlx::query_as::<_, Parametro>(
         "SELECT * FROM parametros WHERE nombre_parametro = $1"
     )
@@ -68,7 +86,12 @@ pub async fn get_parametro_by_nombre(
     .fetch_optional(&app_state.pool_pg)
     .await
     {
-        Ok(Some(parametro)) => HttpResponse::Ok().json(parametro),
+        Ok(Some(parametro)) => {
+            if let Ok(json_str) = serde_json::to_string(&parametro) {
+                app_state.set_cached(&cache_key, json_str, 60);
+            }
+            HttpResponse::Ok().json(parametro)
+        }
         Ok(None) => HttpResponse::NotFound().json(serde_json::json!({
             "error": format!("Parámetro '{}' no encontrado", nombre)
         })),
@@ -102,7 +125,12 @@ pub async fn crear_parametro(
     .fetch_one(&app_state.pool_pg)
     .await
     {
-        Ok(p) => HttpResponse::Created().json(p),
+        Ok(p) => {
+            app_state.invalidate_cache_prefix("fecha_cierre");
+            app_state.invalidate_cache_prefix("parametro");
+            app_state.invalidate_cache_prefix("version_sistema");
+            HttpResponse::Created().json(p)
+        }
         Err(e) => {
             log::error!("Error creando parámetro: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({
@@ -141,7 +169,12 @@ pub async fn actualizar_parametro(
     .fetch_one(&app_state.pool_pg)
     .await
     {
-        Ok(p) => HttpResponse::Ok().json(p),
+        Ok(p) => {
+            app_state.invalidate_cache_prefix("fecha_cierre");
+            app_state.invalidate_cache_prefix("parametro");
+            app_state.invalidate_cache_prefix("version_sistema");
+            HttpResponse::Ok().json(p)
+        }
         Err(e) => {
             log::error!("Error actualizando parámetro: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({
@@ -163,7 +196,12 @@ pub async fn eliminar_parametro(
         .execute(&app_state.pool_pg)
         .await
     {
-        Ok(_) => HttpResponse::Ok().body("Parámetro eliminado"),
+        Ok(_) => {
+            app_state.invalidate_cache_prefix("fecha_cierre");
+            app_state.invalidate_cache_prefix("parametro");
+            app_state.invalidate_cache_prefix("version_sistema");
+            HttpResponse::Ok().body("Parámetro eliminado")
+        }
         Err(e) => {
             log::error!("Error eliminando parámetro: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({
@@ -174,21 +212,41 @@ pub async fn eliminar_parametro(
     }
 }
 
-// ✅ FUNCIÓN ESPECIAL: Obtener fecha_cierre
+// ✅ FUNCIÓN ESPECIAL: Obtener fecha_cierre (con caché en memoria)
 pub async fn get_fecha_cierre(app_state: web::Data<AppState>) -> impl Responder {
+    if let Some(cached) = app_state.get_cached("fecha_cierre_json") {
+        return HttpResponse::Ok()
+            .content_type("application/json")
+            .body(cached);
+    }
+
     match sqlx::query_scalar::<_, Option<chrono::NaiveDate>>(
         "SELECT p_date FROM parametros WHERE nombre_parametro = 'fecha_cierre'"
     )
     .fetch_one(&app_state.pool_pg)
     .await
     {
-        Ok(Some(fecha)) => HttpResponse::Ok().json(serde_json::json!({
-            "fecha_cierre": fecha
-        })),
-        Ok(None) => HttpResponse::Ok().json(serde_json::json!({
-            "fecha_cierre": null,
-            "mensaje": "No hay fecha de cierre configurada"
-        })),
+        Ok(Some(fecha)) => {
+            let json_body = serde_json::json!({
+                "fecha_cierre": fecha
+            }).to_string();
+            app_state.set_cached("fecha_cierre_json", json_body.clone(), 120);
+            app_state.set_cached("fecha_cierre_val", fecha.to_string(), 120);
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .body(json_body)
+        }
+        Ok(None) => {
+            let json_body = serde_json::json!({
+                "fecha_cierre": null,
+                "mensaje": "No hay fecha de cierre configurada"
+            }).to_string();
+            app_state.set_cached("fecha_cierre_json", json_body.clone(), 120);
+            app_state.set_cached("fecha_cierre_val", "NONE".to_string(), 120);
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .body(json_body)
+        }
         Err(e) => {
             log::error!("Error obteniendo fecha_cierre: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({
@@ -199,19 +257,36 @@ pub async fn get_fecha_cierre(app_state: web::Data<AppState>) -> impl Responder 
     }
 }
 
-// ✅ FUNCIÓN ESPECIAL: Obtener versión del sistema (Pública para LoginPage)
+// ✅ FUNCIÓN ESPECIAL: Obtener versión del sistema (Pública para LoginPage, con caché)
 pub async fn get_version_sistema(app_state: web::Data<AppState>) -> impl Responder {
+    if let Some(cached) = app_state.get_cached("version_sistema") {
+        return HttpResponse::Ok()
+            .content_type("application/json")
+            .body(cached);
+    }
+
     match sqlx::query_scalar::<_, Option<String>>(
         "SELECT p_text FROM parametros WHERE nombre_parametro = 'version_sistema' LIMIT 1"
     )
     .fetch_optional(&app_state.pool_pg)
     .await
     {
-        Ok(Some(Some(version))) => HttpResponse::Ok().json(serde_json::json!({
-            "version": version
-        })),
-        _ => HttpResponse::Ok().json(serde_json::json!({
-            "version": "3.2"
-        })),
+        Ok(Some(Some(version))) => {
+            let json_body = serde_json::json!({
+                "version": version
+            }).to_string();
+            app_state.set_cached("version_sistema", json_body.clone(), 300);
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .body(json_body)
+        }
+        _ => {
+            let json_body = serde_json::json!({
+                "version": "3.2"
+            }).to_string();
+            HttpResponse::Ok()
+                .content_type("application/json")
+                .body(json_body)
+        }
     }
 }

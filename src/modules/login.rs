@@ -360,20 +360,38 @@ pub async fn get_login(
 // - 2 DIRECTOR
 // - 3 OPERADOR
     if !puede_ingresar_fuera_de_fecha(login_data.id_rol) {
-        let fecha_cierre_result = sqlx::query_scalar::<_, Option<NaiveDate>>(
-            "SELECT p_date FROM parametros WHERE nombre_parametro = 'fecha_cierre'",
-        )
-        .fetch_optional(pool)
-        .await;
+        let fecha_cierre: Option<NaiveDate> = if let Some(val) = state.get_cached("fecha_cierre_val") {
+            if val == "NONE" {
+                None
+            } else {
+                chrono::NaiveDate::parse_from_str(&val, "%Y-%m-%d").ok()
+            }
+        } else {
+            let fecha_cierre_result = sqlx::query_scalar::<_, Option<NaiveDate>>(
+                "SELECT p_date FROM parametros WHERE nombre_parametro = 'fecha_cierre'",
+            )
+            .fetch_optional(pool)
+            .await;
 
-        let fecha_cierre: Option<NaiveDate> = match fecha_cierre_result {
-            Ok(Some(fecha)) => fecha,
-            Ok(None) => None,
-            Err(e) => {
-                error!("Error consultando fecha_cierre: {}", e);
-                return HttpResponse::InternalServerError().json(ErrorResponse {
-                    error: "Error validando fecha de cierre".to_string(),
-                });
+            match fecha_cierre_result {
+                Ok(Some(fecha)) => {
+                    if let Some(f) = fecha {
+                        state.set_cached("fecha_cierre_val", f.to_string(), 120);
+                    } else {
+                        state.set_cached("fecha_cierre_val", "NONE".to_string(), 120);
+                    }
+                    fecha
+                }
+                Ok(None) => {
+                    state.set_cached("fecha_cierre_val", "NONE".to_string(), 120);
+                    None
+                }
+                Err(e) => {
+                    error!("Error consultando fecha_cierre: {}", e);
+                    return HttpResponse::InternalServerError().json(ErrorResponse {
+                        error: "Error validando fecha de cierre".to_string(),
+                    });
+                }
             }
         };
 

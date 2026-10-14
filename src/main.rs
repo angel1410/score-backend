@@ -83,15 +83,17 @@ async fn main() -> std::io::Result<()> {
     // ✅ Conexión a PostgreSQL
     let pool_pg = PgPool::connect(&url_pg).await.expect("Error conectando a BD");
 
-    // ✅ Inicializar stores para Rate Limiting y CAPTCHA
+    // ✅ Inicializar stores para Rate Limiting, CAPTCHA y Caché en memoria
     let login_attempts = Arc::new(Mutex::new(HashMap::new()));
     let captcha_store = Arc::new(Mutex::new(HashMap::new()));
+    let memory_cache = Arc::new(Mutex::new(HashMap::new()));
 
     println!("\n🚀 Backend SCORE iniciado");
     println!("========================================");
     println!("📡 Servidor: http://127.0.0.1:9000");
     println!("🔐 JWT: Configurado");
     println!("🛡️ Protección: Honeypot + CAPTCHA + Rate Limiting + Auth middleware");
+    println!("⚡ Caché: En memoria activo (Parámetros / Roles / Fechas)");
     println!("🌐 CORS: {}", allowed_origin);
     println!("📁 Archivos públicos: /files -> ./files/templates");
     println!("📄 PDFs inline: /files/guia_rapida.pdf y /files/guia_rapida_admin.pdf");
@@ -120,6 +122,7 @@ async fn main() -> std::io::Result<()> {
                 jwt_secret: jwt_secret.clone(),
                 login_attempts: login_attempts.clone(),
                 captcha_store: captcha_store.clone(),
+                memory_cache: memory_cache.clone(),
             }))
 
             // =====================================================

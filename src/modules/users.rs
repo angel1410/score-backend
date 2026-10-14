@@ -439,11 +439,22 @@ pub async fn get_roles(
         return res;
     }
 
+    if let Some(cached) = app_state.get_cached("roles_list") {
+        return HttpResponse::Ok()
+            .content_type("application/json")
+            .body(cached);
+    }
+
     match sqlx::query_as::<_, (i32, String)>("SELECT id, nombre_rol FROM roles ORDER BY id ASC")
         .fetch_all(&app_state.pool_pg)
         .await
     {
-        Ok(roles) => HttpResponse::Ok().json(roles),
+        Ok(roles) => {
+            if let Ok(json_str) = serde_json::to_string(&roles) {
+                app_state.set_cached("roles_list", json_str, 300); // 5 min TTL
+            }
+            HttpResponse::Ok().json(roles)
+        }
         Err(e) => {
             log::error!("Error al obtener roles: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({
