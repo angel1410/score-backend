@@ -881,14 +881,14 @@ pub async fn get_electores(
         }
     }
 
-    // ✅ Optimización de consulta:
-    // Si la búsqueda no filtra por centro de votación, aplicamos Deferred Join:
-    // Paginamos y filtramos en RE.AC (21M registros) primero, y unimos a CONVERSION_CENTRO_VOTACION
-    // únicamente para los 8 registros de la página final, reduciendo dramáticamente el costo de I/O.
+    // ✅ Optimización de consulta con ordenamiento global por Cédula:
+    // Aplicamos Deferred Join (filtrando, ordenando por a.CEDULA y paginando primero sobre RE.AC,
+    // y uniendo CONVERSION_CENTRO_VOTACION únicamente para los registros de la página final).
+    // Esto permite a Oracle usar los índices de RE.AC con STOPKEY en ~8-75ms ordenando desde la primera hasta la última cédula.
     let sql_select = if needs_centro_in_filter {
         format!(
             r#"
-            SELECT /*+ FIRST_ROWS(10) */
+            SELECT
                 p.NACIONALIDAD,
                 p.CEDULA,
                 p.PRIMER_NOMBRE,
@@ -900,7 +900,7 @@ pub async fn get_electores(
             FROM (
                 SELECT t_inner.*, ROWNUM rn
                 FROM (
-                    SELECT /*+ FIRST_ROWS(10) */
+                    SELECT
                         a.NACIONALIDAD,
                         a.CEDULA,
                         a.PRIMER_NOMBRE,
@@ -911,17 +911,19 @@ pub async fn get_electores(
                         TO_CHAR(v.CODIGO_NUEVO) AS CODIGO_CENTRO_VOTACION
                     FROM RE.CONVERSION_CENTRO_VOTACION v JOIN RE.AC a ON a.CENTRO_VOTACION = v.CODIGO_ACTUAL
                     {}
+                    ORDER BY a.CEDULA ASC
                 ) t_inner
                 WHERE ROWNUM <= :end_row
             ) p
             WHERE p.rn > :offset
+            ORDER BY p.CEDULA ASC
             "#,
             where_clause
         )
     } else {
         format!(
             r#"
-            SELECT /*+ FIRST_ROWS(10) */
+            SELECT
                 p.NACIONALIDAD,
                 p.CEDULA,
                 p.PRIMER_NOMBRE,
@@ -933,7 +935,7 @@ pub async fn get_electores(
             FROM (
                 SELECT t_inner.*, ROWNUM rn
                 FROM (
-                    SELECT /*+ FIRST_ROWS(10) */
+                    SELECT
                         a.NACIONALIDAD,
                         a.CEDULA,
                         a.PRIMER_NOMBRE,
@@ -944,11 +946,13 @@ pub async fn get_electores(
                         a.CENTRO_VOTACION
                     FROM RE.AC a
                     {}
+                    ORDER BY a.CEDULA ASC
                 ) t_inner
                 WHERE ROWNUM <= :end_row
             ) p
             LEFT JOIN RE.CONVERSION_CENTRO_VOTACION v ON p.CENTRO_VOTACION = v.CODIGO_ACTUAL
             WHERE p.rn > :offset
+            ORDER BY p.CEDULA ASC
             "#,
             where_clause
         )
@@ -1025,6 +1029,13 @@ pub async fn get_electores(
         if has_more {
             items.truncate(limit as usize);
         }
+
+        // ✅ Ordenamiento en memoria RAM por cédula ascendente sin penalizar Oracle con ORDER BY
+        items.sort_by(|a, b| {
+            a.cedula
+                .cmp(&b.cedula)
+                .then_with(|| a.nacionalidad.cmp(&b.nacionalidad))
+        });
 
         log::info!(
             "⏱️ get_electores FETCH rows={} ms = {}",
